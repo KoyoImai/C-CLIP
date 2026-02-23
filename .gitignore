@@ -1,0 +1,15 @@
+
+outputs/
+logs/
+bash/
+
+
+__pycache__/
+*.pyc
+*.pkl
+*.npy
+*.pt
+*.log
+.vscode/
+*.pdf
+*.sh

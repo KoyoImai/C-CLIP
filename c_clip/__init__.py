@@ -1,0 +1,1 @@
+from c_clip.model import CCLIP
