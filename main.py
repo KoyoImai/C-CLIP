@@ -20,12 +20,12 @@ def parse_args():
     # データセット関係
     parser.add_argument("--data_root", type=str, default="/home/kouyou/datasets/")
     parser.add_argument("--task_ids",  type=int, nargs="+", default=None,
-                        help="学習するタスクID (省略時: 0〜7 全タスク)")
+                        help="学習するタスクID (省略時: 0〜7 の全8タスクを実行)")
 
     # model 関係
     parser.add_argument("--clip_model", type=str, default="ViT-B/16",
-                        choices=["ViT-B/32", "ViT-B/16", "ViT-L/14", "ViT-L/14@336px"],
-                        help="CLIP バックボーン")
+                        choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"],
+                        help="CLIP のバックボーン")
     parser.add_argument("--lora_rank", type=int, default=16,
                         help="LoRA のランク r (デフォルト: 16)")
     parser.add_argument("--lora_alpha", type=int, default=None,
