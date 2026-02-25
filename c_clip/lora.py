@@ -128,7 +128,7 @@ class LoRAAttention(nn.Module):
 
         # lora_A は Kaiming 初期化
         nn.init.kaiming_uniform_(self.q_lora_A, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.q_lora_B, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.v_lora_A, a=math.sqrt(5))
 
     def forward(self,
                 x: torch.Tensor,
@@ -279,16 +279,42 @@ def _patch_attention_method(block) -> None:
     block.attention = lora_attention  # type: ignore[method-assign]
 
 def merge_lora(clip_model: nn.Module, alpha: float = 0.5) -> None:
-    
-    assert False
+    """
+    LoRA デルタを CLIP backbone に統合する。
+    論文 Eq.(2): θ^t = θ^(t-1) + α * θ_LoRA
+
+    呼び出し後、各ブロックは通常の nn.Linear / nn.MultiheadAttention に戻る。
+    """
+    _merge_transformer(clip_model.visual.transformer, alpha)
+    _merge_transformer(clip_model.transformer,        alpha)
+
 
 def _merge_transformer(transformer: nn.Module, alpha: float) -> None:
+    for block in transformer.resblocks:
+        # ── Attention マージ ──────────────────────────────────────────
+        if isinstance(block.attn, LoRAAttention):
+            merged_mha = block.attn.merge(alpha)
+            block.attn = merged_mha
+            _restore_attention_method(block)
 
-    assert False
+        # ── MLP c_fc マージ ───────────────────────────────────────────
+        if isinstance(block.mlp.c_fc, LoRALinear):
+            block.mlp.c_fc = block.mlp.c_fc.merge(alpha)
+
+        # ── MLP c_proj マージ ─────────────────────────────────────────
+        if isinstance(block.mlp.c_proj, LoRALinear):
+            block.mlp.c_proj = block.mlp.c_proj.merge(alpha)
+
 
 def _restore_attention_method(block) -> None:
+    """マージ後、attention() を標準の nn.MultiheadAttention 呼び出しに戻す。"""
+    def std_attention(x: torch.Tensor) -> torch.Tensor:
+        mask = block.attn_mask
+        if mask is not None:
+            mask = mask.to(dtype=x.dtype, device=x.device)
+        return block.attn(x, x, x, need_weights=False, attn_mask=mask)[0]
 
-    assert False
+    block.attention = std_attention  # type: ignore[method-assign]
 
     
 def count_lora_params(model: nn.Module) -> int:

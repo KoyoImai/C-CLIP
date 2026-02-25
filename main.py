@@ -11,6 +11,7 @@ from clip.clip import tokenize
 
 from c_clip import CCLIP
 from c_clip.dataset import build_vlcl_benchmark
+from c_clip.trainer import VLCLTrainer
 
 
 def parse_args():
@@ -33,6 +34,18 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--merge_alpha", type=float, default=0.5,
                         help="LoRA 統合係数 α (デフォルト: 0.5)")
+    
+
+    # 学習
+    parser.add_argument("--epochs",         type=int,   default=40)
+    parser.add_argument("--batch_size",     type=int,   default=256)
+    parser.add_argument("--lr_image",       type=float, default=1e-5)
+    parser.add_argument("--lr_image_coco",  type=float, default=5e-7)
+    parser.add_argument("--weight_decay",   type=float, default=0.2)
+    parser.add_argument("--warmup_epochs",  type=int,   default=5)
+    parser.add_argument("--temperature",    type=float, default=0.07)
+    parser.add_argument("--grad_clip",      type=float, default=1.0)
+
     
     # その他いろいろ
     parser.add_argument("--num_workers", type=int, default=8)
@@ -92,24 +105,45 @@ def main():
     学習可能パラメータ: 30,281,216（約28.88M）
     """
 
+    # model = torch.nn.DataParallel(model)
+
 
     # -- データセット構築 -------------------------
     print("[2]: データセット構築")
 
     # データ拡張
-    train_transform = model.train_transform
-    val_transform = model.val_transform
+    try:
+        train_transform = model.train_transform
+        val_transform = model.val_transform
+    except:
+        train_transform = model.module.train_transform
+        val_transform = model.module.val_transform
 
-    train_tasks = build_vlcl_benchmark(data_root=config["data_root"],
-                                       transform=train_transform,
+    train_tasks = build_vlcl_benchmark(transform=train_transform,
                                        tokenizer=tokenize,
                                        split="train",
-                                       task_ids=config["task_ids"]
                                        )
+    val_tasks = build_vlcl_benchmark(transform=val_transform,
+                                     tokenizer=tokenize,
+                                     split="test")
+    
+    
+    # -- トレーナー構築 ---------------------------
+    trainer = VLCLTrainer(model=model,
+                          train_tasks=train_tasks,
+                          val_tasks=val_tasks,
+                          config=config,
+                          save_dir=config["save_dir"])
 
-    val_tasks = None
 
-    assert False
+    # -- 学習の実行 -------------------------------
+    if config.get("eval_only"):
+        print(f"\n[評価のみ] チェックポイント: {config['eval_only']}")
+        task_id = trainer.load_checkpoint(config["eval_only"])
+        trainer.evaluate_all(list(range(task_id + 1)))
+    else:
+        print("\n[3] 継続学習を開始 ...")
+        trainer.train_all_tasks()
     
 
 

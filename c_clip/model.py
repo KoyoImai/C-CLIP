@@ -1,13 +1,14 @@
 
-
+import copy
 import torch.nn as nn
 from typing import Optional
 
 
 import torch
+import torch.nn.functional as F
 
 from clip.clip import load
-from c_clip.lora import inject_lora, count_lora_params
+from c_clip.lora import inject_lora, count_lora_params, merge_lora
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Projector h_ψ
@@ -100,8 +101,101 @@ class CCLIP(nn.Module):
     def embed_dim(self) -> int:
         return self.clip.text_projection.shape[1]
 
+    # ── 特徴抽出 ─────────────────────────────────────────────────────
+
+    def encode_image(self, images: torch.Tensor) -> torch.Tensor:
+        """L2 正規化した画像特徴を返す。"""
+        feats = self.clip.encode_image(images)
+        return F.normalize(feats.float(), dim=-1)
+
+    def encode_text(self, tokens: torch.Tensor) -> torch.Tensor:
+        """L2 正規化したテキスト特徴を返す。"""
+        feats = self.clip.encode_text(tokens)
+        return F.normalize(feats.float(), dim=-1)
+
+    @torch.no_grad()
+    def encode_image_old(self, images: torch.Tensor) -> torch.Tensor:
+        """旧モデルで L2 正規化した画像特徴を返す (勾配なし)。"""
+        if self.old_clip is None:
+            raise RuntimeError("old_clip が未設定です。begin_task() を先に呼んでください。")
+        feats = self.old_clip.encode_image(images)
+        return F.normalize(feats.float(), dim=-1)
+
+    @torch.no_grad()
+    def encode_text_old(self, tokens: torch.Tensor) -> torch.Tensor:
+        """旧モデルで L2 正規化したテキスト特徴を返す (勾配なし)。"""
+        if self.old_clip is None:
+            raise RuntimeError("old_clip が未設定です。begin_task() を先に呼んでください。")
+        feats = self.old_clip.encode_text(tokens)
+        return F.normalize(feats.float(), dim=-1)
 
 
+    # ── 順伝播 ────────────────────────────────────────────────────────
+    def forward(
+        self,
+        images: torch.Tensor,
+        tokens: torch.Tensor,
+        use_ckc: bool = False,
+    ) -> dict:
+        """
+        Args:
+            images  : (N, C, H, W)
+            tokens  : (N, L) — clip.tokenize() の出力
+            use_ckc : True の場合、CKC 損失に必要な追加特徴も計算する
+
+        Returns:
+            dict:
+                image_feat (N, D)   : 新モデル画像特徴
+                text_feat  (N, D)   : 新モデルテキスト特徴
+                logit_scale         : CLIP の学習可能温度
+              use_ckc=True の場合追加:
+                image_proj (N, D)   : Projector 適用後の画像特徴
+                text_proj  (N, D)   : Projector 適用後のテキスト特徴
+                old_image_feat (N,D): 旧モデル画像特徴
+                old_text_feat  (N,D): 旧モデルテキスト特徴
+        """
+        image_feat = self.encode_image(images)
+        text_feat  = self.encode_text(tokens)
+        logit_scale = self.clip.logit_scale.exp()
+
+        out = {
+            "image_feat":  image_feat,
+            "text_feat":   text_feat,
+            "logit_scale": logit_scale,
+        }
+
+        if use_ckc:
+            assert self.old_clip is not None, \
+                "use_ckc=True には begin_task() で old_clip を設定してください。"
+            out["image_proj"]     = self.projector(image_feat)
+            out["text_proj"]      = self.projector(text_feat)
+            out["old_image_feat"] = self.encode_image_old(images)
+            out["old_text_feat"]  = self.encode_text_old(tokens)
+
+        return out
+
+
+    # ── タスクライフサイクル ──────────────────────────────────────────
+    def begin_task(self) -> None:
+        """
+        新タスク開始前に呼ぶ。
+        現在の CLIP を deep copy して旧モデルとして保持する。
+        旧モデルは推論専用 (学習なし)。
+        """
+        self.old_clip = copy.deepcopy(self.clip)
+        self.old_clip.eval()
+        for p in self.old_clip.parameters():
+            p.requires_grad_(False)
+
+    def end_task(self) -> None:
+        """
+        タスク終了後に呼ぶ。
+        LoRA デルタを backbone にマージし、次タスク用に新たな LoRA を注入する。
+        Projector のパラメータはそのまま (タスク間で共有)。
+        """
+        merge_lora(self.clip, alpha=self.merge_alpha)
+        inject_lora(self.clip, self.lora_rank, self.lora_alpha, self.lora_dropout)
+        self.old_clip = None
 
     # -- 学習可能なパラメータ数 ---------------------------------
     def get_param_groups(
