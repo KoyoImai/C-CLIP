@@ -186,7 +186,8 @@ class VLCLTrainer:
         task_id: int,
     ) -> dict:
         # 第 1 タスク (task_id=0) は CKC なし、第 2 タスク以降は CKC あり
-        use_ckc = (task_id > 0)
+        # use_ckc = (task_id > 0)
+        use_ckc = True
 
         total = clip_sum = ckc_sum = 0.0
         n = 0
@@ -230,8 +231,9 @@ class VLCLTrainer:
             if idx % 20 == 0:
                 print(idx, loss.item(), l_clip.item(), l_ckc.item())
 
-                if idx > 100:
-                    break
+                # # デバッグ用に途中終了
+                # if idx > 100:
+                #     break
 
         return {
             "total": total / n,

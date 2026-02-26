@@ -122,10 +122,13 @@ def main():
     train_tasks = build_vlcl_benchmark(transform=train_transform,
                                        tokenizer=tokenize,
                                        split="train",
+                                       cache_dir="/home/kouyou/datasets/HuggingFace"
                                        )
     val_tasks = build_vlcl_benchmark(transform=val_transform,
                                      tokenizer=tokenize,
-                                     split="test")
+                                     split="test",
+                                     cache_dir="/home/kouyou/datasets/HuggingFace"
+                                     )
     
     
     # -- トレーナー構築 ---------------------------

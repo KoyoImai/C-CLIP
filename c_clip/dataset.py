@@ -380,10 +380,21 @@ def _load_hf_split(
     cfg: HFConfig,
     split: str,
     seed: int = 42,
+    cache_dir: Optional[str] = None,
 ):
     """
     HFConfig に基づいて HuggingFace Dataset をロードし、
     split ("train" / "test") に対応するサブセットを返す。
+
+    Parameters
+    ----------
+    cfg       : タスクの HFConfig
+    split     : "train" または "test"
+    seed      : ランダム分割のシード
+    cache_dir : HuggingFace データセットのキャッシュ保存先ディレクトリ。
+                None の場合は HuggingFace のデフォルト
+                (~/.cache/huggingface/datasets) が使用される。
+                環境変数 HF_DATASETS_CACHE でも同様に設定可能。
 
     Returns
     -------
@@ -397,7 +408,8 @@ def _load_hf_split(
 
     # ── Step 1: HF split 名の決定 ────────────────────────────────────────────
     hf_split_name = cfg.hf_train_split if is_train else cfg.hf_test_split
-    hf_ds = hf_load(cfg.repo_id, split=hf_split_name, **cfg.load_kwargs)
+    hf_ds = hf_load(cfg.repo_id, split=hf_split_name,
+                    cache_dir=cache_dir, **cfg.load_kwargs)
 
     # ── Step 2: 内部 split 列によるフィルタリング ─────────────────────────────
     if cfg.split_column is not None:
@@ -432,6 +444,7 @@ def build_vlcl_benchmark(
     split: str = "train",
     task_ids: Optional[List[int]] = None,
     seed: int = 42,
+    cache_dir: Optional[str] = None,
 ) -> List[Dataset]:
     """
     VLCL ベンチマークの各タスクに対応するデータセットを構築して返す。
@@ -441,11 +454,16 @@ def build_vlcl_benchmark(
 
     Parameters
     ----------
-    transform : 画像前処理 (train_transform / val_transform)
-    tokenizer : clip.tokenize
-    split     : "train" または "test"
-    task_ids  : ロードするタスク番号のリスト。None の場合は全タスク (0〜7)
-    seed      : ランダム分割の乱数シード (再現性保証)
+    transform  : 画像前処理 (train_transform / val_transform)
+    tokenizer  : clip.tokenize
+    split      : "train" または "test"
+    task_ids   : ロードするタスク番号のリスト。None の場合は全タスク (0〜7)
+    seed       : ランダム分割の乱数シード (再現性保証)
+    cache_dir  : HuggingFace データセットのキャッシュ保存先ディレクトリ。
+                 例: "/mnt/ssd/hf_cache" や "./datasets"
+                 None の場合は HuggingFace のデフォルト
+                 (~/.cache/huggingface/datasets) を使用する。
+                 環境変数 HF_DATASETS_CACHE を設定することでも同様に制御可能。
 
     Returns
     -------
@@ -473,7 +491,8 @@ def build_vlcl_benchmark(
               f"{cfg.repo_id} をロード中...", flush=True)
 
         try:
-            hf_ds, is_train, n_cap = _load_hf_split(cfg, split, seed=seed)
+            hf_ds, is_train, n_cap = _load_hf_split(cfg, split, seed=seed,
+                                                     cache_dir=cache_dir)
 
             dataset = VLCLDataset(
                 hf_dataset           = hf_ds,

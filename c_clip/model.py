@@ -193,8 +193,16 @@ class CCLIP(nn.Module):
         LoRA デルタを backbone にマージし、次タスク用に新たな LoRA を注入する。
         Projector のパラメータはそのまま (タスク間で共有)。
         """
+
+        # 現在の device を保存（追加したloraモジュールを同一デバイスに載せるため）
+        dev = next(self.clip.parameters()).device
+
         merge_lora(self.clip, alpha=self.merge_alpha)
         inject_lora(self.clip, self.lora_rank, self.lora_alpha, self.lora_dropout)
+
+        # 新しく挿した loraモジュール を GPU へ移動
+        self.clip.to(dev)
+
         self.old_clip = None
 
     # -- 学習可能なパラメータ数 ---------------------------------
