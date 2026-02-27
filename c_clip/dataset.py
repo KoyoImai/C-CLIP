@@ -316,10 +316,11 @@ def _build_index(
     caption_field: str,
     caption_is_list: bool,
     n_captions_per_image: int,
-    is_train: bool,
-) -> List[Tuple[int, int]]:
+    is_train: bool) -> List[Tuple[int, int]]:
     """
-    (row_idx, cap_idx) のフラットなインデックスリストを構築する。
+    PyTroech Datasetのサンプル番号（idx）を，Hugging Face Datasetの行（row）とキャプション番号（cap）に対応づけるための参照リストを作成する関数
+
+    (row_idx, cap_idx) のフラットなインデックスリストを構築する．
 
     caption_is_list=False の場合: 全行を (row_idx, 0) でインデックス
     caption_is_list=True  の場合:
@@ -383,18 +384,18 @@ def _load_hf_split(
     cache_dir: Optional[str] = None,
 ):
     """
-    HFConfig に基づいて HuggingFace Dataset をロードし、
-    split ("train" / "test") に対応するサブセットを返す。
+    HFConfig に基づいて HuggingFace Dataset をロードし，
+    split ("train" / "test") に対応するサブセットを返す．
 
     Parameters
     ----------
     cfg       : タスクの HFConfig
     split     : "train" または "test"
     seed      : ランダム分割のシード
-    cache_dir : HuggingFace データセットのキャッシュ保存先ディレクトリ。
+    cache_dir : HuggingFace データセットのキャッシュ保存先ディレクトリ．
                 None の場合は HuggingFace のデフォルト
-                (~/.cache/huggingface/datasets) が使用される。
-                環境変数 HF_DATASETS_CACHE でも同様に設定可能。
+                (~/.cache/huggingface/datasets) が使用される．
+                環境変数 HF_DATASETS_CACHE でも同様に設定可能．
 
     Returns
     -------
@@ -412,6 +413,7 @@ def _load_hf_split(
                     cache_dir=cache_dir, **cfg.load_kwargs)
 
     # ── Step 2: 内部 split 列によるフィルタリング ─────────────────────────────
+    # 実質的には Flickr30k のみを対象とした訓練・テストデータの分割
     if cfg.split_column is not None:
         filter_val = cfg.split_column_train if is_train else cfg.split_column_test
         hf_ds = hf_ds.filter(
@@ -431,6 +433,11 @@ def _load_hf_split(
         n_cap = cfg.n_captions
     else:
         n_cap = 1
+
+    # 確認
+    print("hf_ds.column_names: ", hf_ds.column_names)
+    print("hf_ds.features: ", hf_ds.features)
+    # assert False
 
     return hf_ds, is_train, n_cap
 
@@ -463,7 +470,7 @@ def build_vlcl_benchmark(
                  例: "/mnt/ssd/hf_cache" や "./datasets"
                  None の場合は HuggingFace のデフォルト
                  (~/.cache/huggingface/datasets) を使用する。
-                 環境変数 HF_DATASETS_CACHE を設定することでも同様に制御可能。
+                 環境変数 HF_DATASETS_CACHE を設定することでも同様に制御可能
 
     Returns
     -------
@@ -491,9 +498,12 @@ def build_vlcl_benchmark(
               f"{cfg.repo_id} をロード中...", flush=True)
 
         try:
-            hf_ds, is_train, n_cap = _load_hf_split(cfg, split, seed=seed,
-                                                     cache_dir=cache_dir)
 
+            # hugging face からデータセット情報をダウンロード
+            hf_ds, is_train, n_cap = _load_hf_split(cfg, split, seed=seed,
+                                                    cache_dir=cache_dir)
+
+            # hugging face 形式のデータセット情報を torch のデータセットとして構築
             dataset = VLCLDataset(
                 hf_dataset           = hf_ds,
                 config               = cfg,
@@ -506,8 +516,9 @@ def build_vlcl_benchmark(
 
             n_images = len(hf_ds)
             n_total  = len(dataset)
+            cap_factor = (n_total // n_images) if n_images > 0 else 1
             print(f"  [Task {tid}: {name:<10s}] {split:5s} | "
-                  f"{n_images:>7,} 画像 × {n_cap} cap "
+                  f"{n_images:>7,} 画像 × {cap_factor} cap "
                   f"= {n_total:>8,} サンプル  ✓")
 
         except Exception as e:
@@ -616,3 +627,5 @@ def compute_recall_at_k(
         )
 
     return metrics
+
+
