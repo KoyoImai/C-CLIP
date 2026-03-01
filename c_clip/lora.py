@@ -17,7 +17,7 @@ class LoRALinear(nn.Module):
     def __init__(self,
                  original: nn.Linear,
                  rank: int,
-                 lora_alphaa: int,
+                 lora_alpha: int,
                  dropout: float = 0.0):
         
         super().__init__()
@@ -26,7 +26,7 @@ class LoRALinear(nn.Module):
         self.out_features = original.out_features
 
         self.rank = rank
-        self.scaling = lora_alphaa / rank
+        self.scaling = lora_alpha / rank
         # self.scaling = lora_alphaa / sqrt(rank) <-- LoRACLIPだとスケーリングはこうなっているけど，LoRA公式的には上で正しいはず
 
         # 元の重みとバイアスを固定して保持する

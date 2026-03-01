@@ -1,10 +1,9 @@
-
-
 """
  ID  名前        HF リポジトリ                              image列    caption列              split 戦略
  ─── ─────────── ─────────────────────────────────────────  ─────────  ─────────────────────  ──────────────────────
   0  flickr30k   nlphuji/flickr30k                          image      caption (List×5)       predefined (内部split列)
-  1  coco        Trickxter/COCO2017-captions                image      caption (str)          predefined (train/validation)
+  1  coco        phiyodr/coco2017                           -          captions (List×5)      predefined (train/validation)
+                 ※ 実画像は /home/kouyou/datasets/coco2017/images/{train2017,val2017}/ から読む
   2  pets        visual-layer/oxford-iiit-pet-vl-enriched   image      caption_enriched (str) predefined (train/test)
   3  lexica      vera365/lexica_dataset                     image      prompt (str)           predefined (train/test)
   4  simpsons    Norod78/simpsons-blip-captions             image      text (str)             random 80/20
@@ -121,16 +120,17 @@ _HF_CONFIG: Dict[str, HFConfig] = {
     ),
 
     # ── Task 1: COCO ─────────────────────────────────────────────────────────
-    # repo   : Trickxter/COCO2017-captions
-    # 構造   : train(118k行) / validation(5k行)、1行=1キャプション
-    # caption: str
-    # test   : validation (5,000画像 × 1キャプション) → n_captions=1
+    # repo   : phiyodr/coco2017
+    # 構造   : train(118k行) / validation(5k行)、1行=1画像×5キャプション
+    #          実画像はローカルディスク (COCO_IMAGE_ROOT) から読み込む
+    # caption: List[str] (5キャプション)
+    # test   : validation (5,000画像 × 5キャプション) → n_captions=5
     "coco": HFConfig(
-        repo_id         = "Trickxter/COCO2017-captions",
-        image_field     = "image",
-        caption_field   = "caption",
-        caption_is_list = False,
-        n_captions      = 1,
+        repo_id         = "phiyodr/coco2017",
+        image_field     = "file_name",   # 画像ファイル名列 (PIL Image ではない)
+        caption_field   = "captions",
+        caption_is_list = True,
+        n_captions      = 5,
         hf_train_split  = "train",
         hf_test_split   = "validation",
     ),
@@ -189,7 +189,7 @@ _HF_CONFIG: Dict[str, HFConfig] = {
         image_field     = "image",
         caption_field   = "text",
         caption_is_list = True,
-        n_captions      = 1,         # 評価は 1:1 マッチング
+        n_captions      = 4,         # 評価は 1:1 マッチング
         hf_train_split  = "train",
         hf_test_split   = "train",
         train_ratio     = 0.8,
@@ -375,6 +375,177 @@ class DummyDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COCO 専用データセット (ローカル画像 + HF メタデータ)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ローカル COCO 画像ルートディレクトリ
+COCO_IMAGE_ROOT: str = "/home/kouyou/datasets/coco2017/images"
+
+
+class COCOLocalDataset(Dataset):
+    """
+    COCO 2017 専用データセット。
+
+    メタデータ (ファイル名・キャプション) は HuggingFace の phiyodr/coco2017 から取得し、
+    実際の画像はローカルディスクから読み込む。
+
+    ディレクトリ構成:
+        {image_root}/train2017/{file_name}   ← 訓練画像
+        {image_root}/val2017/{file_name}     ← 検証画像
+
+    キャプション仕様:
+        phiyodr/coco2017 の "captions" 列は List[str] (5キャプション/画像)。
+        ただし HF 上の実際の型が List[dict] ({"id": ..., "caption": "..."}) の場合にも対応。
+
+        訓練時: 1画像 × 5キャプション → 5サンプルに展開 (caption augmentation)
+        評価時: 1画像 × 5キャプション → n_captions_per_image=5 で Recall@K を多重正解評価
+
+    Parameters
+    ----------
+    hf_dataset   : phiyodr/coco2017 をロード・split済みの HuggingFace Dataset
+                   必要な列: "file_name", "captions"
+    image_root   : ローカル画像ルートディレクトリ (COCO_IMAGE_ROOT)
+    hf_split     : "train" または "validation" (サブディレクトリ名の決定に使用)
+    transform    : 画像前処理 (PIL Image → Tensor)
+    tokenizer    : テキストトークナイザ (clip.tokenize 等)
+    task_id      : タスク番号 (=1)
+    is_train     : True=訓練モード / False=評価モード
+    """
+
+    # HF split 名 → 実際のサブディレクトリ名への対応表
+    _SUBDIR: Dict[str, str] = {
+        "train":      "train2017",
+        "validation": "val2017",
+    }
+
+    def __init__(
+        self,
+        hf_dataset,
+        image_root: str,
+        hf_split: str,
+        transform: Callable,
+        tokenizer: Callable,
+        task_id: int = 1,
+        is_train: bool = True,
+    ):
+        self.hf_dataset  = hf_dataset
+        self.image_root  = Path(image_root)
+        self.hf_split    = hf_split
+        self.transform   = transform
+        self.tokenizer   = tokenizer
+        self.task_id     = task_id
+        self.is_train    = is_train
+
+        # 画像サブディレクトリ: train → train2017 / validation → val2017
+        subdir = self._SUBDIR.get(hf_split, hf_split)
+        self.image_dir = self.image_root / subdir
+
+        # n_captions_per_image: 常に5 (訓練・評価ともに5キャプション/画像)
+        self.n_captions_per_image: int = 5
+
+        # ── キャプションを前処理してメモリに保持 ──────────────────────────────
+        # HF から "file_name" 列と "captions" 列のみ一括取得し、
+        # 実際の画像バイトはロードしない (変更点１の核心)
+        file_names: List[str]        = hf_dataset["file_name"]
+        raw_captions: List           = hf_dataset["captions"]
+
+        # captions が List[dict] の場合 ({"id":…, "caption":"…"}) は str に変換
+        captions_list_raw: List[List[str]] = [
+            self._to_str_list(caps) for caps in raw_captions
+        ]
+
+        # ── キャプション数を n_captions_per_image (=5) に統一 ─────────────────
+        # phiyodr/coco2017 には稀にキャプション数が5未満の行が存在する。
+        # compute_recall_at_k は「N_txt = N_img × n_cap」を前提とするため、
+        # 各画像のキャプション数が揃っていないと AssertionError になる。
+        # → 5未満の場合: 先頭キャプションで不足分を補填
+        # → 5超過の場合: 先頭5件に切り捨て
+        N_CAP = self.n_captions_per_image
+        captions_list: List[List[str]] = []
+        for caps in captions_list_raw:
+            if len(caps) >= N_CAP:
+                captions_list.append(caps[:N_CAP])
+            else:
+                fallback = caps[0] if caps else "a photo"
+                padded = caps + [fallback] * (N_CAP - len(caps))
+                captions_list.append(padded)
+
+        # ── フラットインデックス (row_idx, cap_idx) を構築 ────────────────────
+        # 訓練: 全5キャプションを独立サンプルに展開 (5倍)
+        # 評価: 全5キャプションを展開 (多重正解 Recall@K 用)
+        # 各画像が必ず N_CAP 個のキャプションを持つため、
+        # len(self._index) = N_img × N_CAP が常に成立する。
+        self._index: List[Tuple[int, int]] = [
+            (row_idx, cap_idx)
+            for row_idx in range(len(captions_list))
+            for cap_idx in range(N_CAP)
+        ]
+
+        # メタデータをリストとして保持 (毎回 HF Dataset を参照するより高速)
+        self._file_names: List[str]        = file_names
+        self._captions:   List[List[str]]  = captions_list
+
+    # ── ユーティリティ ────────────────────────────────────────────────────────
+    @staticmethod
+    def _to_str_list(caps) -> List[str]:
+        """
+        HF の captions 列を List[str] に正規化する。
+
+        対応フォーマット:
+          - List[str]                        → そのまま返す
+          - List[dict] ({"caption": "..."})  → "caption" キーの値を抽出
+        """
+        result = []
+        for c in caps:
+            if isinstance(c, str):
+                result.append(c)
+            elif isinstance(c, dict):
+                result.append(c.get("caption", "a photo"))
+            else:
+                result.append(str(c))
+        return result
+
+    # ── Dataset インターフェース ──────────────────────────────────────────────
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        row_idx, cap_idx = self._index[idx]
+
+        # 画像をローカルディスクから読み込む (変更点２の核心)
+        file_name = self._file_names[row_idx]
+
+        # phiyodr/coco2017 の file_name は "val2017/000000000139.jpg" のように
+        # サブディレクトリ名が先頭に含まれる場合がある。
+        # image_dir に既にサブディレクトリが含まれているため、
+        # file_name からはファイル名部分 (basename) のみを使う。
+        file_name  = Path(file_name).name
+        image_path = self.image_dir / file_name
+        try:
+            img = Image.open(image_path).convert("RGB")
+        except FileNotFoundError:
+            # 画像が見つからない場合はグレー画像で代替 (ロバスト性確保)
+            img = Image.new("RGB", (224, 224), color=(128, 128, 128))
+
+        image = self.transform(img)
+
+        # キャプション (変更点３: 5キャプションのうち cap_idx 番目を使用)
+        caption = self._captions[row_idx][cap_idx]
+        if not isinstance(caption, str) or not caption.strip():
+            caption = "a photo"
+        tokens = self.tokenizer([caption])[0]
+
+        return image, tokens, self.task_id
+
+    @staticmethod
+    def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor, list]:
+        images = torch.stack([b[0] for b in batch])
+        tokens = torch.stack([b[1] for b in batch])
+        tids   = [b[2] for b in batch]
+        return images, tokens, tids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HuggingFace ローダー (内部関数)
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_hf_split(
@@ -499,27 +670,61 @@ def build_vlcl_benchmark(
 
         try:
 
-            # hugging face からデータセット情報をダウンロード
-            hf_ds, is_train, n_cap = _load_hf_split(cfg, split, seed=seed,
-                                                    cache_dir=cache_dir)
+            # ── COCO のみローカル画像 + HF メタデータで構築 ──────────────────
+            if name == "coco":
+                from datasets import load_dataset as hf_load
+                hf_split_name = cfg.hf_train_split if split == "train" else cfg.hf_test_split
+                is_train = (split == "train")
 
-            # hugging face 形式のデータセット情報を torch のデータセットとして構築
-            dataset = VLCLDataset(
-                hf_dataset           = hf_ds,
-                config               = cfg,
-                transform            = transform,
-                tokenizer            = tokenizer,
-                task_id              = tid,
-                n_captions_per_image = n_cap,
-                is_train             = is_train,
-            )
+                print(f"  [Task {tid}: {name:<10s}] {split:5s} | "
+                      f"{cfg.repo_id} からメタデータのみロード中 "
+                      f"(split={hf_split_name})...", flush=True)
 
-            n_images = len(hf_ds)
-            n_total  = len(dataset)
-            cap_factor = (n_total // n_images) if n_images > 0 else 1
-            print(f"  [Task {tid}: {name:<10s}] {split:5s} | "
-                  f"{n_images:>7,} 画像 × {cap_factor} cap "
-                  f"= {n_total:>8,} サンプル  ✓")
+                hf_ds = hf_load(
+                    cfg.repo_id,
+                    split    = hf_split_name,
+                    cache_dir = cache_dir,
+                )
+
+                dataset = COCOLocalDataset(
+                    hf_dataset = hf_ds,
+                    image_root = COCO_IMAGE_ROOT,
+                    hf_split   = hf_split_name,
+                    transform  = transform,
+                    tokenizer  = tokenizer,
+                    task_id    = tid,
+                    is_train   = is_train,
+                )
+
+                n_images = len(hf_ds)
+                n_total  = len(dataset)
+                print(f"  [Task {tid}: {name:<10s}] {split:5s} | "
+                      f"{n_images:>7,} 画像 × 5 cap "
+                      f"= {n_total:>8,} サンプル  ✓  "
+                      f"(画像: {COCO_IMAGE_ROOT})")
+
+            else:
+                # hugging face からデータセット情報をダウンロード
+                hf_ds, is_train, n_cap = _load_hf_split(cfg, split, seed=seed,
+                                                        cache_dir=cache_dir)
+
+                # hugging face 形式のデータセット情報を torch のデータセットとして構築
+                dataset = VLCLDataset(
+                    hf_dataset           = hf_ds,
+                    config               = cfg,
+                    transform            = transform,
+                    tokenizer            = tokenizer,
+                    task_id              = tid,
+                    n_captions_per_image = n_cap,
+                    is_train             = is_train,
+                )
+
+                n_images = len(hf_ds)
+                n_total  = len(dataset)
+                cap_factor = (n_total // n_images) if n_images > 0 else 1
+                print(f"  [Task {tid}: {name:<10s}] {split:5s} | "
+                      f"{n_images:>7,} 画像 × {cap_factor} cap "
+                      f"= {n_total:>8,} サンプル  ✓")
 
         except Exception as e:
             print(f"  [Task {tid}: {name:<10s}] ロード失敗: {e}")
@@ -627,4 +832,3 @@ def compute_recall_at_k(
         )
 
     return metrics
-

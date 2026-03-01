@@ -40,7 +40,7 @@ class CCLIP(nn.Module):
 
     def __init__(self,
                  clip_model_name: str           = "ViT-B/16",
-                 lora_rank: int                 = 12,
+                 lora_rank: int                 = 16,
                  lora_alpha: Optional[int]      = None,
                  lora_dropout: float            = 0.1,
                  merge_alpha: float             = 0.5,
