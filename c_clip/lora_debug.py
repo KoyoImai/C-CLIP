@@ -1,3 +1,4 @@
+
 import math
 from typing import Union, Optional
 
@@ -266,39 +267,16 @@ def _inject_transformer(transformer: nn.Module,
 
 def _patch_attention_method(block) -> None:
     """
-    ResidualAttentionBlock の attention() を LoRAAttention に対応した実装で上書きする。
-
-    【DataParallel 対応の設計】
-    クロージャで block を捕捉する実装では、DataParallel がモデルを各 GPU に複製する際に
-    クロージャ内の block 参照が元の GPU 0 のインスタンスを指したままになる。
-    その結果、複製先 GPU (例: cuda:1) の入力 x に対して GPU 0 の重みで
-    F.linear が呼ばれ RuntimeError が発生する。
-
-    これを回避するため、block.__class__ を attention() をオーバーライドした
-    動的サブクラスに差し替える。メソッドは self を通じてアクセスするため、
-    DataParallel の複製時に self が各レプリカを正しく指し、
-    self.attn (LoRAAttention) も対応する GPU 上のものが使われる。
+    ResidualAttentionBlock.attention() を LoRAAttention.forward() を呼ぶように上書き
     """
-    OriginalClass = type(block)
 
-    # 同じ元クラスに対してサブクラスを作るのは一度だけにする
-    # (inject_lora が繰り返し呼ばれても重複してサブクラス化しない)
-    if getattr(OriginalClass, '_lora_attention_patched', False):
-        return
+    def lora_attention(x: torch.Tensor) -> torch.Tensor:
+        mask = block.attn_mask
+        if mask is not None:
+            mask = mask.to(dtype=x.dtype, device=x.device)
+        return block.attn(x, attn_mask=mask)
 
-    class LoRAResidualAttentionBlock(OriginalClass):
-        _lora_attention_patched = True
-
-        def attention(self, x: torch.Tensor) -> torch.Tensor:
-            mask = self.attn_mask
-            if mask is not None:
-                mask = mask.to(dtype=x.dtype, device=x.device)
-            # self.attn は LoRAAttention (nn.Module)。
-            # DataParallel レプリカでは self がレプリカを指すため
-            # self.attn も対応 GPU 上の LoRAAttention になる。
-            return self.attn(x, attn_mask=mask)
-
-    block.__class__ = LoRAResidualAttentionBlock
+    block.attention = lora_attention  # type: ignore[method-assign]
 
 def merge_lora(clip_model: nn.Module, alpha: float = 0.5) -> None:
     """
@@ -329,16 +307,14 @@ def _merge_transformer(transformer: nn.Module, alpha: float) -> None:
 
 
 def _restore_attention_method(block) -> None:
-    """
-    マージ後、block.__class__ を元の ResidualAttentionBlock に戻す。
+    """マージ後、attention() を標準の nn.MultiheadAttention 呼び出しに戻す。"""
+    def std_attention(x: torch.Tensor) -> torch.Tensor:
+        mask = block.attn_mask
+        if mask is not None:
+            mask = mask.to(dtype=x.dtype, device=x.device)
+        return block.attn(x, x, x, need_weights=False, attn_mask=mask)[0]
 
-    元クラスの attention() は self.attn (nn.MultiheadAttention) を
-    標準の (x, x, x) 形式で呼び出すため、マージ後も正しく動作する。
-    """
-    current_class = type(block)
-    if getattr(current_class, '_lora_attention_patched', False):
-        # サブクラスの親 (= 元の ResidualAttentionBlock) に戻す
-        block.__class__ = current_class.__bases__[0]
+    block.attention = std_attention  # type: ignore[method-assign]
 
     
 def count_lora_params(model: nn.Module) -> int:

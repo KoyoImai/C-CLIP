@@ -1,4 +1,3 @@
-
 import math
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -17,7 +16,7 @@ from c_clip.losses import CLIPLoss, CKCLoss
 class VLCLTrainer:
 
     def __init__(self,
-                 model: CCLIP,
+                 model: nn.Module,
                  train_tasks: List[VLCLDataset],
                  val_tasks: List[VLCLDataset],
                  config: dict,
@@ -35,7 +34,6 @@ class VLCLTrainer:
         )
         self.model = self.model.to(self.device)
 
-
         # 損失関数
         self.clip_loss = CLIPLoss()
         self.ckc_loss  = CKCLoss(temperature=config.get("temperature", 0.07))
@@ -45,22 +43,28 @@ class VLCLTrainer:
             "task": [], "epoch": [], "total_loss": [], "clip_loss": [], "ckc_loss": []
         }
 
+    # ── DataParallel アンラップヘルパー ────────────────────────────────
+    @property
+    def _unwrapped(self) -> CCLIP:
+        """
+        DataParallel でラップされていても生の CCLIP インスタンスを返す。
+        begin_task / end_task / get_param_groups 等の呼び出しに使用する。
+        """
+        if isinstance(self.model, nn.DataParallel):
+            return self.model.module
+        return self.model
+
     def train_all_tasks(self) -> None:
         print(f"\n{'='*60}")
         print(f"  C-CLIP Continual Learning on VLCL Benchmark")
-        print(f"  Backbone  : ViT-based ZSCL CLIP")
-        try:
-            print(f"  LoRA rank : {self.model.lora_rank}  alpha: {self.model.lora_alpha}")
-            print(f"  Merge α   : {self.model.merge_alpha}")
-        except:
-            print(f"  LoRA rank : {self.model.module.lora_rank}  alpha: {self.model.module.lora_alpha}")
-            print(f"  Merge α   : {self.model.module.merge_alpha}")
+        print(f"  Backbone  : ViT-based CLIP")
+        print(f"  LoRA rank : {self._unwrapped.lora_rank}  alpha: {self._unwrapped.lora_alpha}")
+        print(f"  Merge α   : {self._unwrapped.merge_alpha}")
         print(f"  Tasks     : {len(self.train_tasks)}")
-        try:
-            print(f"  Trainable : {self.model.trainable_params():,} params")
-        except:
-            print(f"  Trainable : {self.model.module.trainable_params():,} params")
+        print(f"  Trainable : {self._unwrapped.trainable_params():,} params")
         print(f"  Device    : {self.device}")
+        if isinstance(self.model, nn.DataParallel):
+            print(f"  GPU 数    : {len(self.model.device_ids)}")
         print(f"{'='*60}")
 
 
@@ -71,15 +75,19 @@ class VLCLTrainer:
             print(f"{'─'*60}")
 
             # 旧モデルを保存
-            try:
-                self.model.begin_task()
-            except:
-                self.model.module.begin_task()
-
+            self._unwrapped.begin_task()
 
             # タスク専用オプティマイザ・スケジューラ
             optimizer = self._build_optimizer(task_id)
             scheduler = self._build_scheduler(optimizer)
+
+            # データセット数がバッチサイズを下回る場合はデータセット数に合わせる
+            # (例: Simpsons 604サンプル < バッチサイズ1024 → drop_last=True で全サンプル破棄される)
+            configured_bs = self.config.get("batch_size", 256)
+            actual_bs     = min(configured_bs, len(train_ds))
+            if actual_bs < configured_bs:
+                print(f"  [注意] データセット数 ({len(train_ds)}) < バッチサイズ ({configured_bs})")
+                print(f"         バッチサイズを {actual_bs} に自動調整します。")
 
             loader = DataLoader(
                 train_ds,
@@ -113,8 +121,8 @@ class VLCLTrainer:
                     )
 
             # LoRA をマージして次タスクへ
-            print(f"\n  [Task {task_id}] LoRA マージ (α={self.model.merge_alpha}) ...")
-            self.model.end_task()
+            print(f"\n  [Task {task_id}] LoRA マージ (α={self._unwrapped.merge_alpha}) ...")
+            self._unwrapped.end_task()
 
             # 全既存タスクで評価
             if self.val_tasks:
@@ -133,7 +141,13 @@ class VLCLTrainer:
     def evaluate_task(
         self, dataset: VLCLDataset, task_name: str = ""
     ) -> dict:
-        """1 タスク分の Recall@K を計算する。"""
+        """
+        1 タスク分の Recall@K を計算する。
+
+        評価は生の CCLIP (_unwrapped) で行う。
+        DataParallel は forward() しか並列化しないため、
+        encode_image / encode_text は model.module から直接呼ぶ必要がある。
+        """
         self.model.eval()
 
         loader = DataLoader(
@@ -141,6 +155,8 @@ class VLCLTrainer:
             batch_size=self.config.get("eval_batch_size", 512),
             shuffle=False,
             num_workers=self.config.get("num_workers", 4),
+            # pin_memory=True,
+            pin_memory=False,
             collate_fn=VLCLDataset.collate_fn,
         )
 
@@ -148,13 +164,13 @@ class VLCLTrainer:
         for images, tokens, _ in loader:
             images = images.to(self.device)
             tokens = tokens.to(self.device)
-            img_feats.append(self.model.encode_image(images).cpu())
-            txt_feats.append(self.model.encode_text(tokens).cpu())
+            # encode_image / encode_text は DataParallel 非対応のため _unwrapped から呼ぶ
+            img_feats.append(self._unwrapped.encode_image(images).cpu())
+            txt_feats.append(self._unwrapped.encode_text(tokens).cpu())
 
         img_feats = torch.cat(img_feats)
         txt_feats = torch.cat(txt_feats)
 
-        # metrics = compute_recall_at_k(img_feats, txt_feats)
         metrics = compute_recall_at_k(
             img_feats, txt_feats,
             n_captions_per_image=dataset.n_captions_per_image
@@ -189,9 +205,8 @@ class VLCLTrainer:
         optimizer: optim.Optimizer,
         task_id: int,
     ) -> dict:
-        # 第 1 タスク (task_id=0) は CKC なし、第 2 タスク以降は CKC あり
-        # use_ckc = (task_id > 0)
-        use_ckc = True
+        # Task 0 は CKC なし（過去タスクが存在しないため）、Task 1 以降は CKC あり
+        use_ckc = (task_id > 0)
 
         total = clip_sum = ckc_sum = 0.0
         n = 0
@@ -205,10 +220,15 @@ class VLCLTrainer:
             out = self.model(images, tokens, use_ckc=use_ckc)
 
             # ── CLIP 損失 ─────────────────────────────────────────
+            # DataParallel では各 GPU が logit_scale スカラーを返すため
+            # gather 後に shape (num_gpus,) になる → .mean() でスカラーに戻す
+            logit_scale = out["logit_scale"]
+            if logit_scale.dim() > 0:
+                logit_scale = logit_scale.mean()
+
             l_clip = self.clip_loss(
-                out["image_feat"], out["text_feat"], out["logit_scale"]
+                out["image_feat"], out["text_feat"], logit_scale
             )
-            # print("l_clip: ", l_clip)
 
             # ── CKC 損失 ─────────────────────────────────────────
             if use_ckc:
@@ -234,10 +254,6 @@ class VLCLTrainer:
 
             if idx % 20 == 0:
                 print(idx, loss.item(), l_clip.item(), l_ckc.item())
-
-                # # デバッグ用に途中終了
-                # if idx > 100:
-                #     break
 
         return {
             "total": total / n,
@@ -266,10 +282,7 @@ class VLCLTrainer:
 
         lr_proj = lr_img
 
-        try:
-            param_groups = self.model.get_param_groups(lr_img, lr_text, lr_proj)
-        except:
-            param_groups = self.model.module.get_param_groups(lr_img, lr_text, lr_proj)
+        param_groups = self._unwrapped.get_param_groups(lr_img, lr_text, lr_proj)
 
         return optim.AdamW(
             param_groups,
@@ -294,17 +307,20 @@ class VLCLTrainer:
     # ── チェックポイント ───────────────────────────────────────────────
     def _save_checkpoint(self, task_id: int) -> None:
         path = self.save_dir / f"cclip_task{task_id}.pt"
+        # DataParallel でラップされている場合、_unwrapped の state_dict を保存する。
+        # これにより "module." プレフィックスなしで保存され、
+        # ロード時に DataParallel の有無に関わらず使用できる。
         torch.save({
-            "task_id":    task_id,
-            "model_state": self.model.state_dict(),
-            "config":     self.config,
-            "history":    self.history,
+            "task_id":     task_id,
+            "model_state": self._unwrapped.state_dict(),
+            "config":      self.config,
+            "history":     self.history,
         }, path)
         print(f"  [保存] {path}")
 
     def load_checkpoint(self, path: str) -> int:
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"])
+        self._unwrapped.load_state_dict(ckpt["model_state"])
         self.history = ckpt.get("history", self.history)
         task_id = ckpt["task_id"]
         print(f"  [ロード] {path}  (task_id={task_id})")

@@ -1,11 +1,10 @@
-
-
 import os
 import yaml
 import argparse
 
 
 import torch
+import torch.nn as nn
 
 from clip.clip import tokenize
 
@@ -34,7 +33,6 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--merge_alpha", type=float, default=0.5,
                         help="LoRA 統合係数 α (デフォルト: 0.5)")
-    
 
     # 学習
     parser.add_argument("--epochs",         type=int,   default=40)
@@ -46,7 +44,6 @@ def parse_args():
     parser.add_argument("--temperature",    type=float, default=0.07)
     parser.add_argument("--grad_clip",      type=float, default=1.0)
 
-    
     # その他いろいろ
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
@@ -58,8 +55,6 @@ def parse_args():
                         help="評価のみ実行: チェックポイントパスを指定")
 
     return parser.parse_args()
-
-
 
 
 def load_config(args):
@@ -76,8 +71,6 @@ def load_config(args):
         config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
     return config
-
-
 
 
 def main():
@@ -97,27 +90,29 @@ def main():
                   merge_alpha=config["merge_alpha"],
                   device=config["device"]
                  )
-    
+
     print(f"  Embed dim : {model.embed_dim}")
     print(f"  学習可能パラメータ: {model.trainable_params():,}")
-    """
-    ・LoRA（rank=16）とテキスト埋め込み層を学習可能にした場合
-    学習可能パラメータ: 30,281,216（約28.88M）
-    """
 
-    # model = torch.nn.DataParallel(model)
-
+    # -- DataParallel の設定 -------------------
+    # 利用可能な GPU が複数ある場合、DataParallel で並列化する。
+    # DataParallel はモデルを各 GPU にコピーし、バッチを分割して処理する。
+    # trainer 内では model.module (= _unwrapped) を通じて CCLIP の
+    # begin_task / end_task / get_param_groups 等を呼び出す。
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"  DataParallel: {n_gpus} GPUs を使用します")
+        model = nn.DataParallel(model)
+    else:
+        print(f"  DataParallel: 無効 (GPU 数={n_gpus})")
 
     # -- データセット構築 -------------------------
     print("[2]: データセット構築")
 
-    # データ拡張
-    try:
-        train_transform = model.train_transform
-        val_transform = model.val_transform
-    except:
-        train_transform = model.module.train_transform
-        val_transform = model.module.val_transform
+    # DataParallel でラップされていても train/val_transform は model.module から取得する
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    train_transform = base_model.train_transform
+    val_transform   = base_model.val_transform
 
     train_tasks = build_vlcl_benchmark(transform=train_transform,
                                        tokenizer=tokenize,
@@ -129,8 +124,8 @@ def main():
                                      split="test",
                                      cache_dir="/home/kouyou/datasets/HuggingFace"
                                      )
-    
-    
+
+
     # -- トレーナー構築 ---------------------------
     trainer = VLCLTrainer(model=model,
                           train_tasks=train_tasks,
@@ -147,10 +142,7 @@ def main():
     else:
         print("\n[3] 継続学習を開始 ...")
         trainer.train_all_tasks()
-    
 
 
 if __name__ == "__main__":
     main()
-
-
