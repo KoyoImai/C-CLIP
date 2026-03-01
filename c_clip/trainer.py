@@ -154,7 +154,11 @@ class VLCLTrainer:
         img_feats = torch.cat(img_feats)
         txt_feats = torch.cat(txt_feats)
 
-        metrics = compute_recall_at_k(img_feats, txt_feats)
+        # metrics = compute_recall_at_k(img_feats, txt_feats)
+        metrics = compute_recall_at_k(
+            img_feats, txt_feats,
+            n_captions_per_image=dataset.n_captions_per_image
+        )
 
         if task_name:
             print(

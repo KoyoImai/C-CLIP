@@ -628,4 +628,3 @@ def compute_recall_at_k(
 
     return metrics
 
-
