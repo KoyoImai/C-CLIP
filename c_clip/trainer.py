@@ -2,21 +2,20 @@ import math
 from pathlib import Path
 from typing import List, Optional, Dict
 
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-
 from c_clip import CCLIP
 from c_clip.dataset import VLCLDataset, TASK_NAMES, compute_recall_at_k
 from c_clip.losses import CLIPLoss, CKCLoss
 
+
 class VLCLTrainer:
 
     def __init__(self,
-                 model: nn.Module,
+                 model: CCLIP,
                  train_tasks: List[VLCLDataset],
                  val_tasks: List[VLCLDataset],
                  config: dict,
@@ -67,14 +66,13 @@ class VLCLTrainer:
             print(f"  GPU 数    : {len(self.model.device_ids)}")
         print(f"{'='*60}")
 
-
         for task_id, train_ds in enumerate(self.train_tasks):
             name = TASK_NAMES[task_id] if task_id < len(TASK_NAMES) else f"task_{task_id}"
             print(f"\n{'─'*60}")
             print(f"  [Task {task_id}: {name}]  samples={len(train_ds)}")
             print(f"{'─'*60}")
 
-            # 旧モデルを保存
+            # 旧モデルを保存  [Fix 5: try/except を廃止し _unwrapped 経由で呼ぶ]
             self._unwrapped.begin_task()
 
             # タスク専用オプティマイザ・スケジューラ
@@ -82,7 +80,7 @@ class VLCLTrainer:
             scheduler = self._build_scheduler(optimizer)
 
             # データセット数がバッチサイズを下回る場合はデータセット数に合わせる
-            # (例: Simpsons 604サンプル < バッチサイズ1024 → drop_last=True で全サンプル破棄される)
+            # [Fix 2: actual_bs を DataLoader に渡す]
             configured_bs = self.config.get("batch_size", 256)
             actual_bs     = min(configured_bs, len(train_ds))
             if actual_bs < configured_bs:
@@ -94,7 +92,6 @@ class VLCLTrainer:
                 batch_size=actual_bs,
                 shuffle=True,
                 num_workers=self.config.get("num_workers", 4),
-                # pin_memory=True,
                 pin_memory=False,
                 collate_fn=VLCLDataset.collate_fn,
                 drop_last=True,
@@ -120,7 +117,7 @@ class VLCLTrainer:
                         f"ckc={losses['ckc']:.4f}"
                     )
 
-            # LoRA をマージして次タスクへ
+            # LoRA をマージして次タスクへ  [Fix 5: _unwrapped.end_task()]
             print(f"\n  [Task {task_id}] LoRA マージ (α={self._unwrapped.merge_alpha}) ...")
             self._unwrapped.end_task()
 
@@ -130,11 +127,10 @@ class VLCLTrainer:
                 self.evaluate_all(list(range(task_id + 1)))
 
             self._save_checkpoint(task_id)
-        
+
         print(f"\n{'='*60}")
         print("  全タスクの学習が完了しました。")
         print(f"{'='*60}\n")
-    
 
     # ── 評価 ───────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -143,10 +139,8 @@ class VLCLTrainer:
     ) -> dict:
         """
         1 タスク分の Recall@K を計算する。
-
-        評価は生の CCLIP (_unwrapped) で行う。
-        DataParallel は forward() しか並列化しないため、
-        encode_image / encode_text は model.module から直接呼ぶ必要がある。
+        [Fix 4] DataParallel は forward() しか並列化しないため、
+        encode_image / encode_text は _unwrapped 経由で呼ぶ必要がある。
         """
         self.model.eval()
 
@@ -155,7 +149,6 @@ class VLCLTrainer:
             batch_size=self.config.get("eval_batch_size", 512),
             shuffle=False,
             num_workers=self.config.get("num_workers", 4),
-            # pin_memory=True,
             pin_memory=False,
             collate_fn=VLCLDataset.collate_fn,
         )
@@ -197,7 +190,6 @@ class VLCLTrainer:
         print(f"    [{'Average':<12s}] I2T R@1={avg_i2t:5.1f}%  T2I R@1={avg_t2i:5.1f}%")
         return results
 
-
     # ── 1 エポック学習 ─────────────────────────────────────────────────
     def _train_one_epoch(
         self,
@@ -205,8 +197,11 @@ class VLCLTrainer:
         optimizer: optim.Optimizer,
         task_id: int,
     ) -> dict:
-        # Task 0 は CKC なし（過去タスクが存在しないため）、Task 1 以降は CKC あり
-        use_ckc = (task_id > 0)
+        # 論文通り Task 0 を含む全タスクで CKC 損失を使用する。
+        # Task 0 の学習開始前に begin_task() が呼ばれており、
+        # old_clip には事前学習済み CLIP がコピーされているため
+        # use_ckc=True でも old_clip=None にはならない。
+        use_ckc = True
 
         total = clip_sum = ckc_sum = 0.0
         n = 0
@@ -261,22 +256,17 @@ class VLCLTrainer:
             "ckc":   ckc_sum / n,
         }
 
-
     # ── オプティマイザ / スケジューラ ──────────────────────────────────
     def _build_optimizer(self, task_id: int) -> optim.Optimizer:
         """
-        論文の LR 設定:
-          - COCO (task 1): text_lr = 80 × image_lr,  image_lr = 5e-7
-          - その他       : text_lr = 10 × image_lr,  image_lr = 1e-5
-
-        ZSCL の実装を参照し、Visual と Text で別の LR を設定する。
+        論文 Appendix A.2 の LR 設定:
+          - flickr30k (task 0): lr_image = 1e-5,  text = 10x image  -> text = 1e-4
+          - coco      (task 1): lr_image = 5e-7,  text = 80x image  -> text = 4e-5
+          - その他    (task 2+): lr_image = 3e-5, text = 10x image  -> text = 3e-4
         """
         task_name = TASK_NAMES[task_id] if task_id < len(TASK_NAMES) else ""
 
-        # 論文 Appendix A.2 の学習率設定:
-        #   flickr30k : lr_image = 1e-5,  text = 10x image
-        #   coco      : lr_image = 5e-7,  text = 80x image
-        #   その他    : lr_image = 3e-5,  text = 10x image
+        # [Fix 3: flickr30k / coco / others の 3 段階 LR]
         if task_name == "coco":
             lr_img  = self.config.get("lr_image_coco", 5e-7)
             lr_text = lr_img * 80
@@ -290,6 +280,7 @@ class VLCLTrainer:
 
         lr_proj = lr_img
 
+        # [Fix 5: _unwrapped 経由で get_param_groups を呼ぶ]
         param_groups = self._unwrapped.get_param_groups(lr_img, lr_text, lr_proj)
 
         return optim.AdamW(
@@ -311,11 +302,10 @@ class VLCLTrainer:
 
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-
     # ── チェックポイント ───────────────────────────────────────────────
     def _save_checkpoint(self, task_id: int) -> None:
         path = self.save_dir / f"cclip_task{task_id}.pt"
-        # DataParallel でラップされている場合、_unwrapped の state_dict を保存する。
+        # [Fix 6: DataParallel でラップされている場合、_unwrapped の state_dict を保存]
         # これにより "module." プレフィックスなしで保存され、
         # ロード時に DataParallel の有無に関わらず使用できる。
         torch.save({
