@@ -91,7 +91,7 @@ class VLCLTrainer:
 
             loader = DataLoader(
                 train_ds,
-                batch_size=self.config.get("batch_size", 256),
+                batch_size=actual_bs,
                 shuffle=True,
                 num_workers=self.config.get("num_workers", 4),
                 # pin_memory=True,
@@ -273,11 +273,19 @@ class VLCLTrainer:
         """
         task_name = TASK_NAMES[task_id] if task_id < len(TASK_NAMES) else ""
 
+        # 論文 Appendix A.2 の学習率設定:
+        #   flickr30k : lr_image = 1e-5,  text = 10x image
+        #   coco      : lr_image = 5e-7,  text = 80x image
+        #   その他    : lr_image = 3e-5,  text = 10x image
         if task_name == "coco":
             lr_img  = self.config.get("lr_image_coco", 5e-7)
             lr_text = lr_img * 80
-        else:
+        elif task_name == "flickr30k":
             lr_img  = self.config.get("lr_image", 1e-5)
+            lr_text = lr_img * 10
+        else:
+            # Pet, Lexica, Simpsons, WikiArt, Kream, Sketch
+            lr_img  = self.config.get("lr_image_other", 3e-5)
             lr_text = lr_img * 10
 
         lr_proj = lr_img

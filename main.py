@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--batch_size",     type=int,   default=256)
     parser.add_argument("--lr_image",       type=float, default=1e-5)
     parser.add_argument("--lr_image_coco",  type=float, default=5e-7)
+    parser.add_argument("--lr_image_other", type=float, default=3e-5,
+                        help="Pet/Lexica/Simpsons/WikiArt/Kream/Sketch の lr_image (論文 Appendix A.2: 3e-5)")
     parser.add_argument("--weight_decay",   type=float, default=0.2)
     parser.add_argument("--warmup_epochs",  type=int,   default=5)
     parser.add_argument("--temperature",    type=float, default=0.07)
