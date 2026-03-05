@@ -52,6 +52,20 @@ class CKCLoss(nn.Module):
 
     正例: 同一インデックス (同じ image-text ペアを新旧モデルで処理)
     負例: 異なるインデックス
+
+    【入力の正規化について】
+    論文 Eq.(5) の定義は、画像・テキスト特徴を個別に正規化するのではなく、
+    cat した後にまとめて正規化する:
+      z̃_i = normalize( [f(v_i), g(c_i)] )   ← 生特徴を cat → 一括正規化
+
+    もし個別正規化済みの特徴を渡すと:
+      z̃_i = normalize( [normalize(f(v_i)), normalize(g(c_i))] )
+    となり、常に画像・テキストが等ウェイトになる (各半分のノルムが 1/√2 に固定)。
+
+    一括正規化では各モダリティの元のノルムが相対的な重みに反映されるため、
+    論文の意図に沿った表現が得られる。
+    したがって new_image_proj / new_text_proj / old_image_feat / old_text_feat は
+    いずれも正規化前の生特徴（backbone または Projector の出力のまま）を渡すこと。
     """
 
     def __init__(self, temperature: float = 0.07):
@@ -60,12 +74,16 @@ class CKCLoss(nn.Module):
 
     def forward(
         self,
-        new_image_proj: torch.Tensor,   # (N, D) 新モデル画像 → Projector 後
-        new_text_proj: torch.Tensor,    # (N, D) 新モデルテキスト → Projector 後
-        old_image_feat: torch.Tensor,   # (N, D) 旧モデル画像特徴 (L2 正規化済み)
-        old_text_feat: torch.Tensor,    # (N, D) 旧モデルテキスト特徴 (L2 正規化済み)
+        new_image_proj: torch.Tensor,   # (N, D) 新モデル画像 → Projector 後 [正規化なし]
+        new_text_proj: torch.Tensor,    # (N, D) 新モデルテキスト → Projector 後 [正規化なし]
+        old_image_feat: torch.Tensor,   # (N, D) 旧モデル画像特徴 [正規化なし / 生特徴]
+        old_text_feat: torch.Tensor,    # (N, D) 旧モデルテキスト特徴 [正規化なし / 生特徴]
     ) -> torch.Tensor:
-        # 論文の記述通り image+text を cat してから正規化
+        # 論文 Eq.(5) の定義通り: image + text を cat してから一括正規化
+        #   h̃_i = normalize([h_ψ(f(v_i)), h_ψ(g(c_i))])
+        #   z̃_i = normalize([f_{t-1}(v_i), g_{t-1}(c_i)])
+        # 個別正規化後に cat すると normalize([normalize(f), normalize(g)]) となり、
+        # 各モダリティのノルム情報が失われるため、生特徴のまま cat する。
         h = F.normalize(torch.cat([new_image_proj, new_text_proj], dim=-1), dim=-1)  # (N, 2D)
         z = F.normalize(torch.cat([old_image_feat,  old_text_feat],  dim=-1), dim=-1)  # (N, 2D)
 
