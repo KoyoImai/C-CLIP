@@ -1,4 +1,3 @@
-
 import copy
 import torch.nn as nn
 from typing import Optional
@@ -78,7 +77,7 @@ class CCLIP(nn.Module):
                 "class_embedding",
                 # "text_projection",
                 # "visual.proj",
-                # "logit_scale",
+                "logit_scale",
             ]):
                 param.requires_grad = True
 
@@ -102,20 +101,36 @@ class CCLIP(nn.Module):
         return self.clip.text_projection.shape[1]
 
     # ── 特徴抽出 ─────────────────────────────────────────────────────
-
     def encode_image(self, images: torch.Tensor) -> torch.Tensor:
-        """L2 正規化した画像特徴を返す。"""
+        """L2 正規化した画像特徴を返す。CLIPLoss・Recall@K 評価に使用。"""
         feats = self.clip.encode_image(images)
         return F.normalize(feats.float(), dim=-1)
 
     def encode_text(self, tokens: torch.Tensor) -> torch.Tensor:
-        """L2 正規化したテキスト特徴を返す。"""
+        """L2 正規化したテキスト特徴を返す。CLIPLoss・Recall@K 評価に使用。"""
         feats = self.clip.encode_text(tokens)
         return F.normalize(feats.float(), dim=-1)
 
+    def _encode_image_raw(self, images: torch.Tensor) -> torch.Tensor:
+        """正規化前の生画像特徴を返す。Projector への入力専用。
+
+        L2 正規化は情報を破壊する:
+          - ベクトルのノルム（大きさ）情報が消える
+          - 全出力が単位球面上に射影され、分布が均一になる
+          → Projector 内部の BatchNorm が有効に機能しなくなる
+
+        対照学習の慣習 (SimCLR 等) に従い、backbone の生出力を
+        Projector に渡し、L2 正規化は CKCLoss 内の cat 後に行う。
+        """
+        return self.clip.encode_image(images).float()
+
+    def _encode_text_raw(self, tokens: torch.Tensor) -> torch.Tensor:
+        """正規化前の生テキスト特徴を返す。Projector への入力専用。"""
+        return self.clip.encode_text(tokens).float()
+
     @torch.no_grad()
     def encode_image_old(self, images: torch.Tensor) -> torch.Tensor:
-        """旧モデルで L2 正規化した画像特徴を返す (勾配なし)。"""
+        """旧モデルで L2 正規化した画像特徴を返す (勾配なし)。CLIPLoss 用。"""
         if self.old_clip is None:
             raise RuntimeError("old_clip が未設定です。begin_task() を先に呼んでください。")
         feats = self.old_clip.encode_image(images)
@@ -123,11 +138,30 @@ class CCLIP(nn.Module):
 
     @torch.no_grad()
     def encode_text_old(self, tokens: torch.Tensor) -> torch.Tensor:
-        """旧モデルで L2 正規化したテキスト特徴を返す (勾配なし)。"""
+        """旧モデルで L2 正規化したテキスト特徴を返す (勾配なし)。CLIPLoss 用。"""
         if self.old_clip is None:
             raise RuntimeError("old_clip が未設定です。begin_task() を先に呼んでください。")
         feats = self.old_clip.encode_text(tokens)
         return F.normalize(feats.float(), dim=-1)
+
+    @torch.no_grad()
+    def _encode_image_raw_old(self, images: torch.Tensor) -> torch.Tensor:
+        """旧モデルの正規化前の生画像特徴を返す (勾配なし)。CKCLoss 用。
+
+        CKCLoss では z̃_i = normalize([f_{t-1}(v), g_{t-1}(c)]) と定義されており、
+        個別正規化ではなく cat 後にまとめて正規化する。
+        したがって旧モデルの特徴も生のまま渡し、正規化は CKCLoss 内に委ねる。
+        """
+        if self.old_clip is None:
+            raise RuntimeError("old_clip が未設定です。begin_task() を先に呼んでください。")
+        return self.old_clip.encode_image(images).float()
+
+    @torch.no_grad()
+    def _encode_text_raw_old(self, tokens: torch.Tensor) -> torch.Tensor:
+        """旧モデルの正規化前の生テキスト特徴を返す (勾配なし)。CKCLoss 用。"""
+        if self.old_clip is None:
+            raise RuntimeError("old_clip が未設定です。begin_task() を先に呼んでください。")
+        return self.old_clip.encode_text(tokens).float()
 
 
     # ── 順伝播 ────────────────────────────────────────────────────────
@@ -145,17 +179,33 @@ class CCLIP(nn.Module):
 
         Returns:
             dict:
-                image_feat (N, D)   : 新モデル画像特徴
-                text_feat  (N, D)   : 新モデルテキスト特徴
-                logit_scale         : CLIP の学習可能温度
+                image_feat    (N, D) : 新モデル画像特徴  [L2 正規化済み / CLIPLoss 用]
+                text_feat     (N, D) : 新モデルテキスト特徴 [L2 正規化済み / CLIPLoss 用]
+                logit_scale          : CLIP の学習可能温度パラメータ
               use_ckc=True の場合追加:
-                image_proj (N, D)   : Projector 適用後の画像特徴
-                text_proj  (N, D)   : Projector 適用後のテキスト特徴
-                old_image_feat (N,D): 旧モデル画像特徴
-                old_text_feat  (N,D): 旧モデルテキスト特徴
+                image_proj    (N, D) : 生特徴 → Projector 後 [正規化なし / CKCLoss 用]
+                text_proj     (N, D) : 生特徴 → Projector 後 [正規化なし / CKCLoss 用]
+                old_image_feat (N,D) : 旧モデルの生画像特徴  [正規化なし / CKCLoss 用]
+                old_text_feat  (N,D) : 旧モデルの生テキスト特徴 [正規化なし / CKCLoss 用]
+
+        【設計方針】
+        CLIPLoss と CKCLoss で特徴の使われ方が異なる:
+          - CLIPLoss : image_feat と text_feat の内積を取る
+                       → 事前に L2 正規化して cos 類似度を計算するのが標準
+          - CKCLoss  : h̃_i = normalize([h_ψ(f(v)), h_ψ(g(c))])
+                             └── Projector への入力は生特徴 (ノルム情報を保持)
+                       z̃_i = normalize([f_{t-1}(v), g_{t-1}(c)])
+                             └── cat 後に一括正規化 → 個別正規化は不要
+        したがって encode では正規化前の生特徴を Projector と CKC に渡し、
+        L2 正規化は CLIPLoss 用の encode_image / encode_text にのみ適用する。
         """
-        image_feat = self.encode_image(images)
-        text_feat  = self.encode_text(tokens)
+        # ── 生特徴を1回だけ計算し、正規化版を派生させる ────────────────
+        # use_ckc=True のとき encode_image と _encode_image_raw を別々に呼ぶと
+        # エンコーダーが2回走り非効率。生特徴から正規化版を派生させる。
+        image_raw   = self._encode_image_raw(images)   # (N, D) 正規化なし
+        text_raw    = self._encode_text_raw(tokens)    # (N, D) 正規化なし
+        image_feat  = F.normalize(image_raw, dim=-1)   # (N, D) 正規化済み
+        text_feat   = F.normalize(text_raw,  dim=-1)   # (N, D) 正規化済み
         logit_scale = self.clip.logit_scale.exp()
 
         out = {
@@ -167,10 +217,20 @@ class CCLIP(nn.Module):
         if use_ckc:
             assert self.old_clip is not None, \
                 "use_ckc=True には begin_task() で old_clip を設定してください。"
-            out["image_proj"]     = self.projector(image_feat)
-            out["text_proj"]      = self.projector(text_feat)
-            out["old_image_feat"] = self.encode_image_old(images)
-            out["old_text_feat"]  = self.encode_text_old(tokens)
+
+            # ── CKCLoss 用: 生特徴 → Projector (新モデル) ───────────────
+            # 正規化前の backbone 出力を Projector に渡す。
+            # ノルム情報を保持することで Projector の BatchNorm が有効に機能し、
+            # より豊かな知識変換空間を学習できる。
+            # （image_raw / text_raw は既に上で計算済みなので追加コストなし）
+            out["image_proj"] = self.projector(image_raw)   # (N, D)
+            out["text_proj"]  = self.projector(text_raw)    # (N, D)
+
+            # ── CKCLoss 用: 旧モデルの生特徴 ────────────────────────────
+            # CKCLoss 内で cat([old_image, old_text]) → normalize するため
+            # 旧モデルの特徴も個別正規化なしの生のまま渡す。
+            out["old_image_feat"] = self._encode_image_raw_old(images)   # (N, D)
+            out["old_text_feat"]  = self._encode_text_raw_old(tokens)    # (N, D)
 
         return out
 
