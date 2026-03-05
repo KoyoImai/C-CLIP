@@ -2,6 +2,8 @@
 outputs/
 logs/
 bash/
+wikiart_captions_out/
+wikiart_captions_out_blip2/
 
 
 __pycache__/
