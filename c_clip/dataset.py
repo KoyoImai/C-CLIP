@@ -1,15 +1,17 @@
 """
- ID  名前        HF リポジトリ                              image列    caption列              split 戦略
- ─── ─────────── ─────────────────────────────────────────  ─────────  ─────────────────────  ──────────────────────
-  0  flickr30k   nlphuji/flickr30k                          image      caption (List×5)       predefined (内部split列)
-  1  coco        phiyodr/coco2017                           -          captions (List×5)      predefined (train/validation)
+ ID  名前        HF リポジトリ                              image列    caption列                          split 戦略
+ ─── ─────────── ─────────────────────────────────────────  ─────────  ─────────────────────────────────  ──────────────────────
+  0  flickr30k   nlphuji/flickr30k                          image      caption (List×5)                   predefined (内部split列)
+  1  coco        phiyodr/coco2017                           -          captions (List×5)                  predefined (train/validation)
                  ※ 実画像は /home/kouyou/datasets/coco2017/images/{train2017,val2017}/ から読む
-  2  pets        visual-layer/oxford-iiit-pet-vl-enriched   image      caption_enriched (str) predefined (train/test)
-  3  lexica      vera365/lexica_dataset                     image      prompt (str)           predefined (train/test)
-  4  simpsons    Norod78/simpsons-blip-captions             image      text (str)             random 80/20
-  5  wikiart     fusing/wikiart_captions                    image      text (List×4)          random 80/20
-  6  kream       hahminlew/kream-product-blip-captions      image      text (str)             random 50/50
-  7  sketch      zoheb/sketch-scene                         image      text (str)             random 80/20
+  2  pets        visual-layer/oxford-iiit-pet-vl-enriched   image      caption_enriched (str)             predefined (train/test)
+  3  lexica      vera365/lexica_dataset                     image      prompt (str)                       predefined (train/test)
+  4  simpsons    Norod78/simpsons-blip-captions             image      text (str)                         random 80/20
+  5  wikiart     fusing/wikiart_captions (画像のみ使用)       image      ローカル parquet の caption (str)   random 80/20
+                 ※ キャプションは generate_wikiart_captions.py が生成した parquet から読む
+                    build_vlcl_benchmark の wikiart_captions_path 引数 (既定値: ./wikiart_captions_out_blip2/wikiart_blip_captions.parquet) で指定
+  6  kream       hahminlew/kream-product-blip-captions      image      text (str)                         random 50/50
+  7  sketch      zoheb/sketch-scene                         image      text (str)                         random 80/20
 """
 
 from __future__ import annotations
@@ -181,15 +183,16 @@ _HF_CONFIG: Dict[str, HFConfig] = {
     # ── Task 5: WikiArt ──────────────────────────────────────────────────────
     # repo   : fusing/wikiart_captions
     # 構造   : train のみ → 80/20 ランダム分割
-    # caption: List[str] (4種テンプレートキャプション)
-    #          訓練: 全4キャプションを独立サンプルに展開
-    #          評価: 先頭キャプションのみ (n_captions=1)
+    # 画像   : HF の image 列を使用
+    # caption: ローカル parquet (generate_wikiart_captions.py の出力) から取得
+    #          → WikiArtBLIP2Dataset が担当 (このHFConfigはimage取得のみに利用)
+    # n_captions=1, caption_is_list=False (BLIP2は1画像1キャプション)
     "wikiart": HFConfig(
         repo_id         = "fusing/wikiart_captions",
         image_field     = "image",
-        caption_field   = "text",
-        caption_is_list = True,
-        n_captions      = 4,         # 評価は 1:1 マッチング
+        caption_field   = "text",   # WikiArtBLIP2Dataset では使用しない (parquetを使う)
+        caption_is_list = False,
+        n_captions      = 1,
         hf_train_split  = "train",
         hf_test_split   = "train",
         train_ratio     = 0.8,
@@ -546,8 +549,164 @@ class COCOLocalDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HuggingFace ローダー (内部関数)
+# WikiArt BLIP2 専用データセット (HF画像 + ローカル parquet キャプション)
 # ─────────────────────────────────────────────────────────────────────────────
+
+class WikiArtBLIP2Dataset(Dataset):
+    """
+    WikiArt 専用データセット。
+
+    画像は HuggingFace の fusing/wikiart_captions から取得し、
+    キャプションは generate_wikiart_captions.py が生成したローカル parquet から取得する。
+
+    parquet フォーマット:
+        image_idx : int   — fusing/wikiart_captions train split における元インデックス
+        caption   : str   — BLIP2 が生成したキャプション
+
+    train/test 分割:
+        fusing/wikiart_captions の train split に対して seed=42 で 80/20 に分割する。
+        parquet の image_idx は分割前の元インデックスを指すため、
+        HF データセットに _orig_idx 列を付与してから分割することで
+        split 後も元インデックスとキャプションの対応を保持する。
+
+    Parameters
+    ----------
+    hf_dataset_split : train_test_split 後の HuggingFace Dataset (train or test 側)
+                       _orig_idx 列を含む (build_wikiart_blip2_dataset で付与済み)
+    caption_lookup   : {image_idx: caption_str} の辞書
+    transform        : 画像前処理 (PIL Image → Tensor)
+    tokenizer        : テキストトークナイザ (clip.tokenize 等)
+    task_id          : タスク番号 (=5)
+    """
+
+    def __init__(
+        self,
+        hf_dataset_split,
+        caption_lookup: Dict[int, str],
+        transform: Callable,
+        tokenizer: Callable,
+        task_id: int = 5,
+    ):
+        self.hf_dataset_split  = hf_dataset_split
+        self.caption_lookup    = caption_lookup
+        self.transform         = transform
+        self.tokenizer         = tokenizer
+        self.task_id           = task_id
+        self.n_captions_per_image: int = 1   # BLIP2 は 1画像 1キャプション
+
+        # _orig_idx 列を一括取得してリストとして保持 (毎回HFを参照するより高速)
+        self._orig_indices: List[int] = hf_dataset_split["_orig_idx"]
+
+        n_missing = sum(1 for i in self._orig_indices if i not in caption_lookup)
+        if n_missing > 0:
+            print(f"  [WikiArtBLIP2] 警告: {n_missing}/{len(self._orig_indices)} 件の"
+                  f"キャプションが parquet に存在しません。\"a photo\" で補完します。")
+
+    def __len__(self) -> int:
+        return len(self.hf_dataset_split)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        row = self.hf_dataset_split[idx]
+
+        # 画像 (HF から取得)
+        img = row["image"]
+        if not isinstance(img, Image.Image):
+            img = Image.fromarray(img)
+        image = self.transform(img.convert("RGB"))
+
+        # キャプション (parquet から元インデックスで引く)
+        orig_idx = self._orig_indices[idx]
+        caption  = self.caption_lookup.get(orig_idx, "a photo")
+        if not isinstance(caption, str) or not caption.strip():
+            caption = "a photo"
+        tokens = self.tokenizer([caption])[0]
+
+        return image, tokens, self.task_id
+
+    @staticmethod
+    def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor, list]:
+        images = torch.stack([b[0] for b in batch])
+        tokens = torch.stack([b[1] for b in batch])
+        tids   = [b[2] for b in batch]
+        return images, tokens, tids
+
+
+def _build_wikiart_blip2_dataset(
+    captions_path: str,
+    split: str,
+    transform: Callable,
+    tokenizer: Callable,
+    task_id: int,
+    seed: int = 42,
+    cache_dir: Optional[str] = None,
+) -> "WikiArtBLIP2Dataset":
+    """
+    WikiArtBLIP2Dataset を構築して返すファクトリ関数。
+
+    処理フロー:
+      1. parquet を読み込み {image_idx: caption} 辞書を構築
+      2. fusing/wikiart_captions を HF からロード (image 列のみ利用)
+      3. _orig_idx 列を付与して元インデックスを保持
+      4. train_test_split(test_size=0.2, seed=seed) で 80/20 分割
+      5. split に対応するサブセットと辞書を WikiArtBLIP2Dataset に渡す
+
+    Parameters
+    ----------
+    captions_path : parquet ファイルのパス
+    split         : \"train\" または \"test\"
+    transform     : 画像前処理
+    tokenizer     : テキストトークナイザ
+    task_id       : タスク番号
+    seed          : 分割シード (既存 WikiArt と同一の 42 を使用)
+    cache_dir     : HuggingFace キャッシュディレクトリ
+    """
+    import pandas as pd
+    from datasets import load_dataset as hf_load
+
+    # ── Step 1: parquet → {image_idx: caption} ──────────────────────────────
+    df = pd.read_parquet(captions_path)
+    # 必要列の存在確認
+    if "image_idx" not in df.columns or "caption" not in df.columns:
+        raise ValueError(
+            f"parquet ファイル '{captions_path}' に 'image_idx' または 'caption' 列が"
+            f"存在しません。列名: {list(df.columns)}"
+        )
+    caption_lookup: Dict[int, str] = dict(
+        zip(df["image_idx"].astype(int).tolist(), df["caption"].tolist())
+    )
+    print(f"  [WikiArtBLIP2] parquet ロード完了: {len(caption_lookup):,} 件")
+
+    # ── Step 2: HF データセットをロード (image + _orig_idx 列のみ使用) ────────
+    hf_ds_full = hf_load(
+        "fusing/wikiart_captions",
+        split     = "train",
+        cache_dir = cache_dir,
+    )
+
+    # ── Step 3: _orig_idx 列を付与 ───────────────────────────────────────────
+    # train_test_split 後も元インデックスを追跡するためのカラム
+    hf_ds_full = hf_ds_full.add_column(
+        "_orig_idx", list(range(len(hf_ds_full)))
+    )
+
+    # ── Step 4: 80/20 分割 (既存 WikiArt と同一パラメータ) ──────────────────
+    split_ds    = hf_ds_full.train_test_split(test_size=0.2, seed=seed)
+    hf_split    = split_ds["train"] if split == "train" else split_ds["test"]
+    is_train    = (split == "train")
+
+    n_images = len(hf_split)
+    coverage = sum(1 for i in hf_split["_orig_idx"] if i in caption_lookup)
+    print(f"  [WikiArtBLIP2] {split:5s} | {n_images:>7,} 画像  "
+          f"(キャプション一致: {coverage:,}/{n_images:,})")
+
+    # ── Step 5: データセット構築 ─────────────────────────────────────────────
+    return WikiArtBLIP2Dataset(
+        hf_dataset_split = hf_split,
+        caption_lookup   = caption_lookup,
+        transform        = transform,
+        tokenizer        = tokenizer,
+        task_id          = task_id,
+    )
 def _load_hf_split(
     cfg: HFConfig,
     split: str,
@@ -623,6 +782,7 @@ def build_vlcl_benchmark(
     task_ids: Optional[List[int]] = None,
     seed: int = 42,
     cache_dir: Optional[str] = None,
+    wikiart_captions_path: str = "./wikiart_captions_out_blip2/wikiart_blip_captions.parquet",
 ) -> List[Dataset]:
     """
     VLCL ベンチマークの各タスクに対応するデータセットを構築して返す。
@@ -632,16 +792,19 @@ def build_vlcl_benchmark(
 
     Parameters
     ----------
-    transform  : 画像前処理 (train_transform / val_transform)
-    tokenizer  : clip.tokenize
-    split      : "train" または "test"
-    task_ids   : ロードするタスク番号のリスト。None の場合は全タスク (0〜7)
-    seed       : ランダム分割の乱数シード (再現性保証)
-    cache_dir  : HuggingFace データセットのキャッシュ保存先ディレクトリ。
-                 例: "/mnt/ssd/hf_cache" や "./datasets"
-                 None の場合は HuggingFace のデフォルト
-                 (~/.cache/huggingface/datasets) を使用する。
-                 環境変数 HF_DATASETS_CACHE を設定することでも同様に制御可能
+    transform             : 画像前処理 (train_transform / val_transform)
+    tokenizer             : clip.tokenize
+    split                 : "train" または "test"
+    task_ids              : ロードするタスク番号のリスト。None の場合は全タスク (0〜7)
+    seed                  : ランダム分割の乱数シード (再現性保証)
+    cache_dir             : HuggingFace データセットのキャッシュ保存先ディレクトリ。
+                            例: "/mnt/ssd/hf_cache" や "./datasets"
+                            None の場合は HuggingFace のデフォルト
+                            (~/.cache/huggingface/datasets) を使用する。
+                            環境変数 HF_DATASETS_CACHE を設定することでも同様に制御可能
+    wikiart_captions_path : WikiArt タスク用の BLIP2 生成キャプション parquet ファイルパス。
+                            generate_wikiart_captions.py が出力した parquet を指定する。
+                            既定値: "./wikiart_captions_out_blip2/wikiart_blip_captions.parquet"
 
     Returns
     -------
@@ -702,6 +865,27 @@ def build_vlcl_benchmark(
                       f"{n_images:>7,} 画像 × 5 cap "
                       f"= {n_total:>8,} サンプル  ✓  "
                       f"(画像: {COCO_IMAGE_ROOT})")
+
+            # ── WikiArt: HF画像 + ローカル parquet キャプション ──────────────
+            elif name == "wikiart":
+                print(f"  [Task {tid}: {name:<10s}] {split:5s} | "
+                      f"BLIP2 parquet: {wikiart_captions_path}", flush=True)
+
+                dataset = _build_wikiart_blip2_dataset(
+                    captions_path = wikiart_captions_path,
+                    split         = split,
+                    transform     = transform,
+                    tokenizer     = tokenizer,
+                    task_id       = tid,
+                    seed          = seed,
+                    cache_dir     = cache_dir,
+                )
+
+                n_total = len(dataset)
+                print(f"  [Task {tid}: {name:<10s}] {split:5s} | "
+                      f"{n_total:>7,} 画像 × 1 cap "
+                      f"= {n_total:>8,} サンプル  ✓  "
+                      f"(BLIP2 parquet)")
 
             else:
                 # hugging face からデータセット情報をダウンロード

@@ -193,6 +193,11 @@ def clean_caption(text: str) -> str:
             # 除去後が空または極端に短い場合はスキップ
             if len(cleaned.strip()) < 4:
                 continue
+
+            # cleaned = text[len(prefix):].strip()   # 除去後の空白も即座に除去
+            # if len(cleaned) < 4:                   # strip 済みなのでそのまま比較
+            #     continue
+
             # 先頭を大文字に・末尾に「.」を付与
             result = cleaned[0].upper() + cleaned[1:] if cleaned else text
             return result if result.endswith(".") else result + "."

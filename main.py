@@ -21,6 +21,15 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default="/home/kouyou/datasets/")
     parser.add_argument("--task_ids",  type=int, nargs="+", default=None,
                         help="学習するタスクID (省略時: 0〜7 の全8タスクを実行)")
+    parser.add_argument(
+        "--wikiart_captions_path",
+        type=str,
+        default="./wikiart_captions_out_blip2/wikiart_blip_captions.parquet",
+        help=(
+            "WikiArt タスク (task 5) に使用する BLIP2 生成キャプションの parquet パス。"
+            "generate_wikiart_captions.py が出力したファイルを指定する。"
+        ),
+    )
 
     # model 関係
     parser.add_argument("--clip_model", type=str, default="ViT-B/16",
@@ -119,12 +128,14 @@ def main():
     train_tasks = build_vlcl_benchmark(transform=train_transform,
                                        tokenizer=tokenize,
                                        split="train",
-                                       cache_dir="/home/kouyou/datasets/HuggingFace"
+                                       cache_dir="/home/kouyou/datasets/HuggingFace",
+                                       wikiart_captions_path=args.wikiart_captions_path,
                                        )
     val_tasks = build_vlcl_benchmark(transform=val_transform,
                                      tokenizer=tokenize,
                                      split="test",
-                                     cache_dir="/home/kouyou/datasets/HuggingFace"
+                                     cache_dir="/home/kouyou/datasets/HuggingFace",
+                                     wikiart_captions_path=args.wikiart_captions_path,
                                      )
 
 
