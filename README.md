@@ -74,6 +74,7 @@ python3 generate_wikiart_captions.py --model blip2 --output_dir ./wikiart_captio
 
 - flickr30k，coco，pets，lexica，simpsons，sikiart，kream，sketchに対する検索タスクの性能（タスク毎）
 
-    |  Method          |   flickr30k |  coco      |   pets     |   lexica   |  simpsons  |   wikiart  |  kream     |  sketch    |
-    |------------------|-------------|------------|------------|------------|------------|------------|------------|------------|
-    |  CLIP(Vit-B/16)  |             |            |            |            |            |            |            |            |
+    |  Method             |   flickr30k |  coco      |   pets     |   lexica   |  simpsons  |   wikiart  |  kream     |  sketch    |
+    |---------------------|-------------|------------|------------|------------|------------|------------|------------|------------|
+    |  CLIP(Vit-B/16) I2T |   82.2      |  51.7      |  11.0      |  37.8      |  16.6      |  17.9      |  20.4      |  4.3       |
+    |  CLIP(Vit-B/16) T2I |   62.1      |  32.7      |  11.2      |  34.9      |  13.9      |  19.9      |  21.8      |  5.1       |
