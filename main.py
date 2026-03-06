@@ -105,17 +105,31 @@ def main():
     print(f"  Embed dim : {model.embed_dim}")
     print(f"  学習可能パラメータ: {model.trainable_params():,}")
 
-    # -- DataParallel の設定 -------------------
+    # -- DataParallel / SyncBatchNorm の設定 ---
     # 利用可能な GPU が複数ある場合、DataParallel で並列化する。
-    # DataParallel はモデルを各 GPU にコピーし、バッチを分割して処理する。
-    # trainer 内では model.module (= _unwrapped) を通じて CCLIP の
-    # begin_task / end_task / get_param_groups 等を呼び出す。
+    #
+    # 【SyncBatchNorm について】
+    # Projector 内の BatchNorm1d は、DataParallel 環境では各 GPU 上の
+    # サブバッチ (batch_size / n_gpus 件) の統計量しか使えない。
+    # 例: batch=1024, GPU×8 → 各GPU で 128 件のみで μ, σ² を推定。
+    #
+    # SyncBatchNorm は All-Reduce 通信で全 GPU のサンプルを合算し、
+    # batch 全体 (1024 件) の統計量で正規化するため、
+    # CKC Loss の対照学習に必要な一貫した特徴表現が得られる。
+    #
+    # 【変換タイミングの重要性】
+    # convert_sync_batchnorm() は DataParallel でラップする「前」に呼ぶこと。
+    # ラップ後に呼ぶと model.module 以下のモジュールのみ変換され、
+    # DataParallel のレプリカ生成時に変換が反映されない場合がある。
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
+        print(f"  SyncBatchNorm: BatchNorm1d → SyncBatchNorm に変換します")
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  # ← DataParallel の前に変換
         print(f"  DataParallel: {n_gpus} GPUs を使用します")
         model = nn.DataParallel(model)
     else:
-        print(f"  DataParallel: 無効 (GPU 数={n_gpus})")
+        # GPU が1枚以下の場合は変換不要 (BatchNorm1d のまま動作)
+        print(f"  DataParallel: 無効 (GPU 数={n_gpus})、BatchNorm1d をそのまま使用")
 
     # -- データセット構築 -------------------------
     print("[2]: データセット構築")
