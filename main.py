@@ -151,7 +151,11 @@ def main():
     if config.get("eval_only"):
         print(f"\n[評価のみ] チェックポイント: {config['eval_only']}")
         task_id = trainer.load_checkpoint(config["eval_only"])
-        trainer.evaluate_all(list(range(task_id + 1)))
+        seen = list(range(task_id + 1))
+        print("\n── タスク別評価 ──")
+        trainer.evaluate_all(seen)
+        print("\n── マージ評価 (論文準拠) ──")
+        trainer.evaluate_merged(seen)
     else:
         print("\n[3] 継続学習を開始 ...")
         trainer.train_all_tasks()

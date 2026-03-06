@@ -123,8 +123,10 @@ class VLCLTrainer:
 
             # 全既存タスクで評価
             if self.val_tasks:
-                print(f"  [Task {task_id}] 評価:")
+                print(f"  [Task {task_id}] タスク別評価:")
                 self.evaluate_all(list(range(task_id + 1)))
+                print(f"  [Task {task_id}] マージ評価 (論文準拠):")
+                self.evaluate_merged(list(range(task_id + 1)))
 
             self._save_checkpoint(task_id)
 
@@ -188,6 +190,158 @@ class VLCLTrainer:
         avg_i2t = sum(v["I2T_R@1"] for v in results.values()) / len(results)
         avg_t2i = sum(v["T2I_R@1"] for v in results.values()) / len(results)
         print(f"    [{'Average':<12s}] I2T R@1={avg_i2t:5.1f}%  T2I R@1={avg_t2i:5.1f}%")
+        return results
+
+    @torch.no_grad()
+    def evaluate_merged(self, seen_task_ids: List[int]) -> dict:
+        """
+        全タスクのテストサンプルを1つのプールに結合し、その中での Recall@K をデータセットごとに計算する（論文 Table 3 準拠）。
+
+        evaluate_all() はタスクごとに独立した (N_task × N_task) の小行列で評価するため、
+        他タスクのサンプルが妨害として登場しない。一方この関数は全タスクのサンプルを
+        結合した (N_total × N_total) の大行列で評価する。
+        各画像が「全データセットの中から」自分のキャプションを検索できるかを測定するため、
+        task ID を使用しない推論を前提とした論文値と直接比較可能な数値が得られる。
+
+        評価手順:
+          1. 全タスクのテスト特徴量を encode してデータセットごとに保持
+          2. 全特徴量を結合し (N_total, D) の1つのプールを作成
+          3. (N_total × N_total) 類似度行列を計算
+          4. 各データセットのサンプルが属する行範囲を使い、
+             N_total 個の候補の中での Recall@K をデータセットごとに算出
+          5. 全データセットの平均を表示
+
+        多重キャプションのタスク (Flickr30k, COCO: n_captions_per_image=5) は
+        先頭キャプション (cap_idx=0) のみを使用し、全タスクで 1:1 マッチングに統一する。
+
+        Parameters
+        ----------
+        seen_task_ids : 評価対象のタスク番号リスト
+
+        Returns
+        -------
+        dict :
+            キー = タスク名 (例: "flickr30k")
+            値   = {"I2T_R@1": float, "I2T_R@5": float, "I2T_R@10": float,
+                    "T2I_R@1": float, "T2I_R@5": float, "T2I_R@10": float}
+            加えて "average" キーに全タスク平均を格納
+        """
+        self.model.eval()
+        k_list = [1, 5, 10]
+
+        # ── Step 1: 各タスクの特徴量を encode ────────────────────────────────
+        per_task_img: List[torch.Tensor] = []
+        per_task_txt: List[torch.Tensor] = []
+        task_names:   List[str]          = []
+
+        for tid in seen_task_ids:
+            dataset = self.val_tasks[tid]
+            n_cap   = dataset.n_captions_per_image
+            name    = TASK_NAMES[tid] if tid < len(TASK_NAMES) else f"task_{tid}"
+
+            loader = DataLoader(
+                dataset,
+                batch_size=self.config.get("eval_batch_size", 512),
+                shuffle=False,
+                num_workers=self.config.get("num_workers", 4),
+                pin_memory=False,
+                collate_fn=VLCLDataset.collate_fn,
+            )
+
+            img_feats, txt_feats = [], []
+            for images, tokens, _ in loader:
+                images = images.to(self.device)
+                tokens = tokens.to(self.device)
+                img_feats.append(self._unwrapped.encode_image(images).cpu())
+                txt_feats.append(self._unwrapped.encode_text(tokens).cpu())
+
+            img_feats = torch.cat(img_feats)  # (N × n_cap, D) または (N, D)
+            txt_feats = torch.cat(txt_feats)
+
+            # n_cap > 1 (Flickr30k / COCO): 先頭キャプション (cap_idx=0) のみ使用
+            # データセットのサンプル順: row0_cap0, row0_cap1, ..., row1_cap0, ...
+            # → [::n_cap] で cap_idx=0 の行だけ取り出す
+            if n_cap > 1:
+                img_feats = img_feats[::n_cap]   # (N, D)
+                txt_feats = txt_feats[::n_cap]   # (N, D)
+
+            per_task_img.append(img_feats)
+            per_task_txt.append(txt_feats)
+            task_names.append(name)
+
+        # ── Step 2: 全タスクを結合して1つのプールを作成 ───────────────────────
+        merged_img = torch.cat(per_task_img)   # (N_total, D)
+        merged_txt = torch.cat(per_task_txt)   # (N_total, D)
+        N_total    = len(merged_img)
+
+        # ── Step 3: (N_total × N_total) 類似度行列を計算 ─────────────────────
+        # メモリ効率のため CPU 上で計算（N_total が大きい場合はチャンク処理も可）
+        sim = merged_img @ merged_txt.t()   # (N_total, N_total): sim[i,j] = img[i]・txt[j]
+
+        # ── Step 4: データセットごとに Recall@K を計算 ───────────────────────
+        # 各データセットのサンプルは結合テンソルの [offset, offset+N_k) 行に対応する。
+        # image[offset + i] の正解テキストは text[offset + i] (1:1 マッチング)。
+        results: dict = {}
+        offset = 0
+
+        for name, img_feats in zip(task_names, per_task_img):
+            N_k = len(img_feats)
+            # このタスクの行スライス
+            sim_i2t = sim[offset : offset + N_k]               # (N_k, N_total): I2T
+            sim_t2i = sim.t()[offset : offset + N_k]           # (N_k, N_total): T2I
+
+            # 正解ラベル: result[offset+i] の正解は offset+i
+            # sim スライス内での列インデックスは offset+i なのでそのまま使う
+            labels = torch.arange(offset, offset + N_k).unsqueeze(1)   # (N_k, 1)
+
+            task_metrics: dict = {}
+            for k in k_list:
+                # I2T: image[i] が正解テキスト (offset+i) を top-k 内に含むか
+                topk_i2t = sim_i2t.topk(min(k, N_total), dim=1).indices   # (N_k, k)
+                task_metrics[f"I2T_R@{k}"] = (
+                    (topk_i2t == labels).any(dim=1).float().mean().item() * 100.0
+                )
+                # T2I: text[i] が正解画像 (offset+i) を top-k 内に含むか
+                topk_t2i = sim_t2i.topk(min(k, N_total), dim=1).indices   # (N_k, k)
+                task_metrics[f"T2I_R@{k}"] = (
+                    (topk_t2i == labels).any(dim=1).float().mean().item() * 100.0
+                )
+
+            results[name] = task_metrics
+            offset += N_k
+
+        # ── Step 5: 全タスク平均 ─────────────────────────────────────────────
+        avg: dict = {}
+        for k in k_list:
+            avg[f"I2T_R@{k}"] = sum(v[f"I2T_R@{k}"] for v in results.values()) / len(results)
+            avg[f"T2I_R@{k}"] = sum(v[f"T2I_R@{k}"] for v in results.values()) / len(results)
+        results["average"] = avg
+
+        # ── 結果表示 (論文 Table 3 レイアウト) ───────────────────────────────
+        col_w = 10
+        header = f"  {'Dataset':<14s}" + "".join(
+            f"{'I2T@' + str(k):>{col_w}s}{'T2I@' + str(k):>{col_w}s}" for k in k_list
+        )
+        sep = "  " + "─" * (len(header) - 2)
+        print(f"\n{sep}")
+        print(f"  Merged Retrieval  (全 {len(seen_task_ids)} タスク結合, N_total={N_total:,})")
+        print(sep)
+        print(header)
+        print(sep)
+        for name in task_names:
+            m = results[name]
+            row = f"  {name:<14s}"
+            for k in k_list:
+                row += f"{m[f'I2T_R@{k}']:>{col_w}.1f}{m[f'T2I_R@{k}']:>{col_w}.1f}"
+            print(row)
+        print(sep)
+        m = results["average"]
+        row = f"  {'average':<14s}"
+        for k in k_list:
+            row += f"{m[f'I2T_R@{k}']:>{col_w}.1f}{m[f'T2I_R@{k}']:>{col_w}.1f}"
+        print(row)
+        print(f"{sep}\n")
+
         return results
 
     # ── 1 エポック学習 ─────────────────────────────────────────────────
