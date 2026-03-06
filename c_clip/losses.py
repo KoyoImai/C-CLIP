@@ -96,3 +96,16 @@ class CKCLoss(nn.Module):
         loss_z2h = F.cross_entropy(sim_z2h, labels)
 
         return (loss_h2z + loss_z2h) / 2.0
+    
+
+    # # 評価データセット
+    # parser.add_argument("--datasets", nargs="+",
+    #                     default=["cifar10", "cifar100"],
+    #                     choices=["cifar10", "cifar100", "imagenet"],
+    #                     help="評価するデータセット")
+    # parser.add_argument("--imagenet_root", type=str,
+    #                     default="/home/kouyou/datasets/ImageNet/val",
+    #                     help="ImageNet バリデーションセットのルートディレクトリ")
+    # parser.add_argument("--cifar_root", type=str,
+    #                     default="/home/kouyou/datasets",
+    #                     help="CIFAR データセットのキャッシュ先")

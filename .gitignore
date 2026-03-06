@@ -4,7 +4,7 @@ logs/
 bash/
 wikiart_captions_out/
 wikiart_captions_out_blip2/
-
+wikiart_captions_out_blip2_short/
 
 __pycache__/
 *.pyc

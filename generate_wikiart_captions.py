@@ -193,10 +193,15 @@ def clean_caption(text: str) -> str:
             # 除去後が空または極端に短い場合はスキップ
             if len(cleaned.strip()) < 4:
                 continue
-            # 先頭を大文字に
-            return cleaned[0].upper() + cleaned[1:] if cleaned else text
-    # プレフィックスに該当しない場合も先頭を大文字に揃える
-    return text[0].upper() + text[1:] if text else text
+            # 先頭を大文字に・末尾に「.」を付与
+            result = cleaned[0].upper() + cleaned[1:] if cleaned else text
+            return result if result.endswith(".") else result + "."
+        
+    # プレフィックスに該当しない場合も先頭を大文字に揃えて「.」を付与
+    if not text:
+        return text
+    result = text[0].upper() + text[1:]
+    return result if result.endswith(".") else result + "."
 
 
 def generate_captions_batch(
@@ -206,7 +211,11 @@ def generate_captions_batch(
     model_type: str,
     device: str,
     max_new_tokens: int = 60,
+    min_new_tokens: int = 20,
     prompt: str = "there is",
+    num_beams: int = 5,
+    length_penalty: float = 1.2,
+    repetition_penalty: float = 1.5,
 ) -> List[str]:
     """
     PIL Image のリストをバッチで処理してキャプション文字列のリストを返す。
@@ -218,8 +227,12 @@ def generate_captions_batch(
     model         : BLIP / BLIP2 のモデル
     model_type    : "blip" または "blip2"
     device        : "cuda" / "cpu" 等 (BLIP 用。BLIP2 は model の配置から自動取得)
-    max_new_tokens : 生成トークン数の上限
-    prompt        : 条件付き生成のプロンプト文字列 (BLIP のみ使用)
+    max_new_tokens     : 生成トークン数の上限
+    min_new_tokens     : 生成トークン数の下限 (短すぎるキャプションを防ぐ)
+    prompt             : 条件付き生成のプロンプト文字列 (BLIP のみ使用)
+    num_beams          : ビームサーチのビーム数 (大きいほど品質向上・低速)
+    length_penalty     : >1.0 で長いシーケンスを優遇し、詳細な記述を促す
+    repetition_penalty : >1.0 で同じ語句の繰り返しを抑制する
 
     Returns
     -------
@@ -276,12 +289,20 @@ def generate_captions_batch(
             generated_ids = model.generate(
                 pixel_values=inputs["pixel_values"],
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                num_beams=num_beams,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
             )
         else:
             # BLIP: 条件付き or 無条件生成
             generated_ids = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                num_beams=num_beams,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
             )
 
     # トークン ID → 文字列に変換 (CPU に戻してデコード)
@@ -351,8 +372,13 @@ def main(args: argparse.Namespace):
     print("=" * 60)
     print("  WikiArt キャプション生成")
     print(f"  モデル      : {args.model}")
-    print(f"  プロンプト  : {repr(args.prompt)}")
-    print(f"  バッチサイズ : {args.batch_size}")
+    print(f"  プロンプト        : {repr(args.prompt)}")
+    print(f"  max_new_tokens    : {args.max_new_tokens}")
+    print(f"  min_new_tokens    : {args.min_new_tokens}")
+    print(f"  num_beams         : {args.num_beams}")
+    print(f"  length_penalty    : {args.length_penalty}")
+    print(f"  repetition_penalty: {args.repetition_penalty}")
+    print(f"  バッチサイズ      : {args.batch_size}")
     print(f"  出力先      : {output_dir}")
     print("=" * 60)
 
@@ -423,7 +449,11 @@ def main(args: argparse.Namespace):
                 captions = generate_captions_batch(
                     images, processor, model, model_type, device,
                     max_new_tokens=args.max_new_tokens,
+                    min_new_tokens=args.min_new_tokens,
                     prompt=args.prompt,
+                    num_beams=args.num_beams,
+                    length_penalty=args.length_penalty,
+                    repetition_penalty=args.repetition_penalty,
                 )
             except RuntimeError as e:
                 # CUDA OOM などへの対処: バッチを半分にして再試行
@@ -552,6 +582,45 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=60,
         help="生成するキャプションの最大トークン数",
+    )
+    parser.add_argument(
+        "--min_new_tokens",
+        type=int,
+        default=20,
+        help=(
+            "生成するキャプションの最小トークン数。"
+            "短すぎるキャプション (例: 'A woman') を防ぐ。"
+            "論文品質 (~15語) を得るには 20〜30 が目安。"
+        ),
+    )
+    parser.add_argument(
+        "--num_beams",
+        type=int,
+        default=5,
+        help=(
+            "ビームサーチのビーム数。"
+            "大きいほど品質向上・速度低下。BLIP/BLIP2 ともに有効。"
+            "推奨: 5 (デフォルト)。速度優先なら 3。"
+        ),
+    )
+    parser.add_argument(
+        "--length_penalty",
+        type=float,
+        default=1.2,
+        help=(
+            "長さペナルティ。>1.0 で長いシーケンスを優遇し詳細な記述を促す。"
+            "ビームサーチ (num_beams>=2) と組み合わせて有効。"
+            "推奨: 1.2〜1.5。"
+        ),
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.5,
+        help=(
+            "繰り返しペナルティ。>1.0 で同じ語句の繰り返しを抑制する。"
+            "推奨: 1.3〜1.5。"
+        ),
     )
     parser.add_argument(
         "--prompt",
