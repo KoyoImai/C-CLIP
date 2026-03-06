@@ -64,8 +64,16 @@ python3 generate_wikiart_captions.py --model blip2 --output_dir ./wikiart_captio
 
 
 ## 評価結果
+まず，事前学習済みCLIPの性能を確認する．
 - CIFAR10，CIFAR100，ImageNetのゼロショット分類性能
 
-    |  Method          |   CIFAR10   |  CIFAR100  |
-    |------------------|-------------|------------|
-    |  CLIP(Vit-B/16)  |             |            |
+    |  Method          |   CIFAR10   |  CIFAR100  |  ImageNet  |
+    |------------------|-------------|------------|------------|
+    |  CLIP(Vit-B/16)  |             |            |            |
+
+
+- flickr30k，coco，pets，lexica，simpsons，sikiart，kream，sketchに対する検索タスクの性能（タスク毎）
+
+    |  Method          |   flickr30k |  coco      |   pets     |   lexica   |  simpsons  |   wikiart  |  kream     |  sketch    |
+    |------------------|-------------|------------|------------|------------|------------|------------|------------|------------|
+    |  CLIP(Vit-B/16)  |             |            |            |            |            |            |            |            |
