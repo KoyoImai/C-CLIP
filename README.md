@@ -69,7 +69,7 @@ python3 generate_wikiart_captions.py --model blip2 --output_dir ./wikiart_captio
 
     |  Method          |   CIFAR10   |  CIFAR100  |  ImageNet  |
     |------------------|-------------|------------|------------|
-    |  CLIP(Vit-B/16)  |             |            |            |
+    |  CLIP(Vit-B/16)  |   90.65     |   68.38    |   65.28    |
 
 
 - flickr30k，coco，pets，lexica，simpsons，sikiart，kream，sketchに対する検索タスクの性能（タスク毎）

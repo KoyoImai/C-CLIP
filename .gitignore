@@ -3,7 +3,7 @@ outputs/
 logs/
 bash/
 wikiart_captions_out/
-wikiart_captions_out_blip2/
+wikiart_captions_out_blip2/chunks
 wikiart_captions_out_blip2_short/
 
 __pycache__/
