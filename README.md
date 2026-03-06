@@ -63,3 +63,9 @@ python3 generate_wikiart_captions.py --model blip2 --output_dir ./wikiart_captio
     ```
 
 
+## 評価結果
+- CIFAR10，CIFAR100，ImageNetのゼロショット分類性能
+
+    |  Method          |   CIFAR10   |  CIFAR100  |
+    |------------------|-------------|------------|
+    |  CLIP(Vit-B/16)  |             |            |
