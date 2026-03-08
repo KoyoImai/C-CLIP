@@ -33,8 +33,13 @@ python3 main.py
 ```
 CLIPのFinetuneを行う場合は，以下を実行してください．
 ```
-python3 generate_wikiart_captions.py --model blip2 --output_dir ./wikiart_captions_out_blip2
+python3 main_finetune.py
 ```
+CLIP-LoRAの学習を行う場合は以下を実行してください．
+```
+python3 main_lora.py
+```
+
 また，各タスクの学習終了後に自動でt2iとi2tの検索佐での評価が実行されます．
 ゼロショット分類の評価は行われませんので，必要があれば別途評価を実行して下さい．
 

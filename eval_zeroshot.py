@@ -103,7 +103,6 @@ IMAGENET_TEMPLATES: List[str] = [
     "a photo of one {}.",
     "a doodle of a {}.",
     "a close-up photo of the {}.",
-    "a photo of a {}.",
     "the origami {}.",
     "the {} in a video game.",
     "a sketch of a {}.",
@@ -148,7 +147,6 @@ IMAGENET_TEMPLATES: List[str] = [
 
 # CIFAR 向け: より短いシンプルなテンプレートセット
 CIFAR_TEMPLATES: List[str] = [
-    "a photo of a {}.",
     "a blurry photo of a {}.",
     "a black and white photo of a {}.",
     "a low contrast photo of a {}.",
@@ -157,10 +155,8 @@ CIFAR_TEMPLATES: List[str] = [
     "a good photo of a {}.",
     "a photo of a small {}.",
     "a photo of a big {}.",
-    "a photo of a {}.",
     "a rendering of a {}.",
     "a {} in a video game.",
-    "a cropped photo of a {}.",
     "the {}.",
     "a photo of a clean {}.",
     "a photo of a dirty {}.",
@@ -169,7 +165,6 @@ CIFAR_TEMPLATES: List[str] = [
     "a photo of the cool {}.",
     "a close-up photo of a {}.",
     "a bright photo of the {}.",
-    "a cropped photo of a {}.",
     "a photo of the {}.",
     "a good photo of the {}.",
     "a photo of one {}.",
@@ -229,30 +224,61 @@ def load_model(
     clip_model_name: str,
     checkpoint_path: Optional[str],
     device: str,
+    model_type: str = "cclip",
 ) -> Tuple[object, object, object]:
     """
-    CCLIP モデルと val_transform をロードする。
+    指定した model_type に応じてモデルをロードする。
 
     Parameters
     ----------
     clip_model_name  : "ViT-B/16" 等
     checkpoint_path  : None = vanilla CLIP (チェックポイントなし)
     device           : "cuda" / "cpu"
+    model_type       : "cclip"    — CCLIP (C-CLIP, LoRA + CKC)
+                       "lora"     — LoRACLIP (CLIP-LoRA ベースライン)
+                       "finetune" — FinetuneCLIP (LoRA なし全パラメータ更新)
 
     Returns
     -------
-    model         : CCLIP インスタンス (eval 済み)
+    model         : モデルインスタンス (eval 済み)
     val_transform : 画像前処理 (PIL → Tensor)
     tokenizer     : clip.tokenize
+
+    Notes
+    -----
+    ゼロショット評価で使用するメソッドは encode_image() / encode_text() /
+    val_transform のみ。CCLIP / LoRACLIP / FinetuneCLIP は全て
+    同一インターフェースを提供するため、model_type を切り替えても
+    評価ループのコードは変わらない。
+
+    チェックポイント保存形式:
+      CCLIP       : cclip_task{N}.pt       (checkpoints/)
+      LoRACLIP    : lora_task{N}.pt        (checkpoints_lora/)
+      FinetuneCLIP: finetune_task{N}.pt    (checkpoints_finetune/)
     """
-    from c_clip import CCLIP
     from clip.clip import tokenize
 
-    model = CCLIP(
-        clip_model_name=clip_model_name,
-        device=device,
-    )
+    # ── モデルクラスをmodel_typeに応じて選択 ─────────────────────────
+    if model_type == "lora":
+        from c_clip.model_lora import LoRACLIP
+        model = LoRACLIP(
+            clip_model_name=clip_model_name,
+            device=device,
+        )
+    elif model_type == "finetune":
+        from c_clip.model_finetune import FinetuneCLIP
+        model = FinetuneCLIP(
+            clip_model_name=clip_model_name,
+            device=device,
+        )
+    else:  # "cclip" (デフォルト)
+        from c_clip import CCLIP
+        model = CCLIP(
+            clip_model_name=clip_model_name,
+            device=device,
+        )
 
+    # ── チェックポイントのロード ──────────────────────────────────────
     if checkpoint_path is not None:
         ckpt = torch.load(checkpoint_path, map_location=device)
         # チェックポイントの形式: {"model_state": ..., "task_id": ...}
@@ -915,6 +941,8 @@ _IMAGENET_SYNSET_TO_NAME: Dict[str, str] = {
     "n13040303": "red wine", "n13044778": "espresso",
     "n13052670": "tea cup", "n13054560": "eggnog",
     "n13133613": "mountain", "n15075141": "bubble",
+    # ── 補完エントリ (方法3フォールバック用) ──────────────────────────────
+
 }
 
 
@@ -1058,13 +1086,19 @@ def collect_checkpoints(
     checkpoint: Optional[str],
     checkpoint_dir: Optional[str],
     no_checkpoint: bool,
+    model_type: str = "cclip",
 ) -> List[Tuple[str, Optional[str]]]:
     """
     評価するチェックポイントのリスト [(label, path), ...] を返す。
 
     - no_checkpoint=True   → [("vanilla CLIP", None)]
     - checkpoint 指定      → [("vanilla CLIP", None), (filename, path)]
-    - checkpoint_dir 指定  → vanilla + ディレクトリ内の cclip_task*.pt をソート順
+    - checkpoint_dir 指定  → vanilla + ディレクトリ内のチェックポイントをソート順
+
+    checkpoint_dir スキャンのファイル名パターン (model_type に依存):
+      cclip    : cclip_task*.pt
+      lora     : lora_task*.pt
+      finetune : finetune_task*.pt
     """
     ckpts: List[Tuple[str, Optional[str]]] = []
 
@@ -1080,9 +1114,16 @@ def collect_checkpoints(
 
     elif checkpoint_dir:
         d = Path(checkpoint_dir)
-        found = sorted(d.glob("cclip_task*.pt"))
+        # model_type に応じたファイル名パターンを選択
+        pattern_map = {
+            "cclip":    "cclip_task*.pt",
+            "lora":     "lora_task*.pt",
+            "finetune": "finetune_task*.pt",
+        }
+        pattern = pattern_map.get(model_type, "cclip_task*.pt")
+        found = sorted(d.glob(pattern))
         if not found:
-            print(f"  警告: {d} に cclip_task*.pt が見つかりません")
+            print(f"  警告: {d} に {pattern} が見つかりません")
         for p in found:
             ckpts.append((p.name, str(p)))
 
@@ -1155,11 +1196,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip_model", default="ViT-B/16",
                         choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"],
                         help="CLIP バックボーン (main.py と揃えること)")
+    parser.add_argument("--model_type", type=str, default="cclip",
+                        choices=["cclip", "lora", "finetune"],
+                        help=(
+                            "評価するモデルの種類:\n"
+                            "  cclip    — CCLIP (C-CLIP, LoRA + CKC)\n"
+                            "  lora     — LoRACLIP (CLIP-LoRA ベースライン)\n"
+                            "  finetune — FinetuneCLIP (LoRA なし全パラメータ更新)\n"
+                            "checkpoint_dir 指定時のスキャンパターンも変わります:\n"
+                            "  cclip→cclip_task*.pt / lora→lora_task*.pt / "
+                            "finetune→finetune_task*.pt"
+                        ))
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument("--checkpoint", type=str, default=None,
                      help="単一チェックポイントファイルのパス (例: ./checkpoints/cclip_task7.pt)")
     grp.add_argument("--checkpoint_dir", type=str, default=None,
-                     help="チェックポイントディレクトリ。cclip_task*.pt を自動スキャン")
+                     help="チェックポイントディレクトリ。model_type に対応した *.pt を自動スキャン")
     grp.add_argument("--no_checkpoint", action="store_true",
                      help="vanilla CLIP (事前学習済みのみ) で評価")
 
@@ -1212,9 +1264,11 @@ def main():
 
     # ── チェックポイント一覧 ──────────────────────────────────────────────────
     ckpt_list = collect_checkpoints(
-        args.checkpoint, args.checkpoint_dir, args.no_checkpoint
+        args.checkpoint, args.checkpoint_dir, args.no_checkpoint,
+        model_type=args.model_type,
     )
-    print(f"\n評価チェックポイント数: {len(ckpt_list)}")
+    print(f"\nモデル種別: {args.model_type}")
+    print(f"評価チェックポイント数: {len(ckpt_list)}")
     for label, path in ckpt_list:
         print(f"  {label}  →  {path or '(なし: vanilla CLIP)'}")
 
@@ -1237,7 +1291,8 @@ def main():
         # モデルロード
         t0 = time.time()
         model, val_transform, tokenizer = load_model(
-            args.clip_model, ckpt_path, device
+            args.clip_model, ckpt_path, device,
+            model_type=args.model_type,
         )
         print(f"  モデルロード: {time.time() - t0:.1f}s")
 
