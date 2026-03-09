@@ -131,6 +131,8 @@ def main():
         # GPU が1枚以下の場合は変換不要 (BatchNorm1d のまま動作)
         print(f"  DataParallel: 無効 (GPU 数={n_gpus})、BatchNorm1d をそのまま使用")
 
+    # assert False
+
     # -- データセット構築 -------------------------
     print("[2]: データセット構築")
 

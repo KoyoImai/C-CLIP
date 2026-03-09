@@ -188,6 +188,7 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
+#-- テキスト・画像エンコーダ --------------
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -199,6 +200,7 @@ class Transformer(nn.Module):
         return self.resblocks(x)
 
 
+#-- 画像エンコーダのクラス ----------------
 class VisualTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
@@ -217,27 +219,56 @@ class VisualTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
-        self.transformer = Transformer(width, layers, heads)
+        # 画像エンコーダのTransformerを構築（テキストエンコーダと異なりマスクは不要）
+        self.transformer = Transformer(width,       # 次元数
+                                       layers,      # 総数
+                                       heads        # head数
+                                       )
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
 
+        #-- Transformer Block に入力する前の処理 ----------------------
+        # 入力画像をパッチ分割
+        x = self.conv1(x)                 # shape = [*, width, grid, grid]
+        # print("x1.shape: ", x.shape)    # x1.shape:  torch.Size([64, 768, 14, 14])
+        
+        # パッチ特徴の形状を変化（バッチサイズ，次元，パッチサイズ*パッチサイズ）
+        x = x.reshape(x.shape[0], x.shape[1], -1)       # shape = [*, width, grid ** 2]
+        # print("x2.shape: ", x.shape)                  # x2.shape:  torch.Size([64, 768, 196])
+        
+        x = x.permute(0, 2, 1)                          # shape = [*, grid ** 2, width]
+        # print("x3.shape: ", x.shape)                  # x3.shape:  torch.Size([64, 196, 768])
+
+        # クラス埋め込みを先頭に追加
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        # print("x4.shape: ", x.shape)    # x4.shape:  torch.Size([64, 197, 768])
+
+        # 位置埋め込みを加算
+        # print("self.positional_embedding.shape: ", self.positional_embedding.shape)     # self.positional_embedding.shape:  torch.Size([197, 768])
+        x = x + self.positional_embedding.to(x.dtype)
+        # print("x5.shape: ", x.shape)                                                    # x5.shape:  torch.Size([64, 197, 768])
+
+        # LayerNorm
+        x = self.ln_pre(x)
+        # print("x6.shape: ", x.shape)        # x6.shape:  torch.Size([64, 197, 768])
+
+        #-- Transformer Block 内の Forward 処理 ---------------------
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
+        # Class Embedding のみを取り出す & LayerNorm
         x = self.ln_post(x[:, 0, :])
+        # print("x7.shape: ", x.shape)      # x7.shape:  torch.Size([64, 768])
 
+        # 最終出力の Projection
         if self.proj is not None:
             x = x @ self.proj
+            # print("x8.shape: ", x.shape)    # x8.shape:  torch.Size([64, 512])
+        
 
         return x
     
@@ -286,12 +317,11 @@ class CLIP(nn.Module):
                 output_dim=embed_dim
             )
 
-        self.transformer = Transformer(
-            width=transformer_width,
-            layers=transformer_layers,
-            heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
-        )
+        self.transformer = Transformer(width=transformer_width,                 # 次元数
+                                       layers=transformer_layers,               # 層数
+                                       heads=transformer_heads,                 # head数
+                                       attn_mask=self.build_attention_mask()    # マスク設定
+                                       )
 
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
@@ -345,18 +375,28 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
+    #-- 画像エンコーダのforward -----------------
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
+    #-- テキストエンコーダのforward --------------
     def encode_text(self, text):
+
+        # トークン埋め込み
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
+        # 位置埋め込みを加算
         x = x + self.positional_embedding.type(self.dtype)
+        
+        # transformer block の forward 処理
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
+
+        # LayerNorm
         x = self.ln_final(x).type(self.dtype)
 
+        # 最終出力のProjection
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
