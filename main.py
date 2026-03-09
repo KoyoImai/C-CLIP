@@ -45,7 +45,7 @@ def parse_args():
 
     # 学習
     parser.add_argument("--epochs",         type=int,   default=40)
-    parser.add_argument("--batch_size",     type=int,   default=256)
+    parser.add_argument("--batch_size",     type=int,   default=1024)
     parser.add_argument("--lr_image",       type=float, default=1e-5)
     parser.add_argument("--lr_image_coco",  type=float, default=5e-7)
     parser.add_argument("--lr_image_other", type=float, default=3e-5,

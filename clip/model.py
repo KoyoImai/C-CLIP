@@ -231,7 +231,7 @@ class VisualTransformer(nn.Module):
     def forward(self, x: torch.Tensor):
 
         #-- Transformer Block に入力する前の処理 ----------------------
-        # 入力画像をパッチ分割
+        # 入力画像をパッチ分割して埋め込む
         x = self.conv1(x)                 # shape = [*, width, grid, grid]
         # print("x1.shape: ", x.shape)    # x1.shape:  torch.Size([64, 768, 14, 14])
         
