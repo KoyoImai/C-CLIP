@@ -35,7 +35,7 @@ class VLCLTrainer:
 
         # 損失関数
         self.clip_loss = CLIPLoss()
-        self.ckc_loss  = CKCLoss(temperature=config.get("temperature", 0.07))
+        self.ckc_loss  = CKCLoss()
 
         # 学習履歴
         self.history: Dict[str, list] = {
@@ -384,6 +384,7 @@ class VLCLTrainer:
                 l_ckc = self.ckc_loss(
                     out["image_proj"],    out["text_proj"],
                     out["old_image_feat"], out["old_text_feat"],
+                    logit_scale,
                 )
             else:
                 l_ckc = torch.tensor(0.0, device=self.device)
