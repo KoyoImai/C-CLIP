@@ -12,13 +12,18 @@ CCLIP は以下の 2 つの Config で学習パラメータを柔軟に制御で
   --trainable_params token_embedding,logit_scale のように指定可能。
 
   指定できるキー:
-    token_embedding      : テキストエンコーダのトークン埋め込み      (25.3M)
-    text_pos_embedding   : テキストエンコーダの位置埋め込み          (39K)
-    text_projection      : テキストエンコーダの最終出力線形層        (262K)
-    class_embedding      : 画像エンコーダの CLS トークン             (768)
-    visual_pos_embedding : 画像エンコーダの位置埋め込み              (151K)
-    visual_proj          : 画像エンコーダの最終出力線形層            (393K)
-    logit_scale          : CLIP の学習可能温度パラメータ (スカラー)  (1)
+    token_embedding      : テキストエンコーダのトークン埋め込み          (25,296,896)
+    text_pos_embedding   : テキストエンコーダの位置埋め込み              (    39,424)
+    text_projection      : テキストエンコーダの最終出力線形層            (   262,144)
+    text_ln              : テキストエンコーダの全 LayerNorm              (    25,600)
+                           (ln_1×12 + ln_2×12 + ln_final)
+    class_embedding      : 画像エンコーダの CLS トークン                 (       768)
+    visual_pos_embedding : 画像エンコーダの位置埋め込み                  (   151,296)
+    visual_proj          : 画像エンコーダの最終出力線形層                (   393,216)
+    visual_ln            : 画像エンコーダの全 LayerNorm                  (    39,936)
+                           (ln_pre + ln_1×12 + ln_2×12 + ln_post)
+    visual_conv1         : 画像エンコーダの patch embedding (Conv2d)     (   589,824)
+    logit_scale          : CLIP の学習可能温度パラメータ (スカラー)      (         1)
 """
 
 import copy
@@ -37,14 +42,19 @@ from c_clip.lora import inject_lora, count_lora_params, merge_lora, LoRAConfig
 # TrainableConfig
 # ─────────────────────────────────────────────────────────────────────────────
 
-# LoRA 非適用パラメータのキー → CLIP 内の名前パターン のマッピング
+# LoRA 非適用パラメータのキー → 判定方式のマッピング
+# 値が文字列の場合は param_name に含まれるかどうかで判定（単純な部分文字列マッチ）
+# 値が None の場合は should_train() 内で個別ロジックで処理する
 _TRAINABLE_KEY_TO_PATTERN = {
     "token_embedding":      "token_embedding",
-    "text_pos_embedding":   "positional_embedding",   # テキストエンコーダ側
+    "text_pos_embedding":   "positional_embedding",   # テキストエンコーダ側（visual 除外）
     "text_projection":      "text_projection",
+    "text_ln":              None,   # 個別ロジック: visual 含まず ".ln_" または "ln_final" を含む
     "class_embedding":      "class_embedding",
-    "visual_pos_embedding": "positional_embedding",   # 画像エンコーダ側
+    "visual_pos_embedding": "positional_embedding",   # 画像エンコーダ側（visual 限定）
     "visual_proj":          "visual.proj",
+    "visual_ln":            None,   # 個別ロジック: "visual" を含み ".ln_" を含む
+    "visual_conv1":         "visual.conv1",
     "logit_scale":          "logit_scale",
 }
 
@@ -53,9 +63,12 @@ _PARAM_COUNT_HINT = {
     "token_embedding":      "25,296,896",
     "text_pos_embedding":   "39,424",
     "text_projection":      "262,144",
+    "text_ln":              "25,600  (ln_1×12 + ln_2×12 + ln_final)",
     "class_embedding":      "768",
     "visual_pos_embedding": "151,296",
     "visual_proj":          "393,216",
+    "visual_ln":            "39,936  (ln_pre + ln_1×12 + ln_2×12 + ln_post)",
+    "visual_conv1":         "589,824",
     "logit_scale":          "1",
 }
 
@@ -70,7 +83,7 @@ class TrainableConfig:
     デフォルト設定は既存実装と同じ:
       token_embedding, text_pos_embedding, class_embedding,
       visual_pos_embedding, logit_scale を学習可能にする。
-      text_projection / visual_proj は固定。
+      text_projection / visual_proj / visual_ln / visual_conv1 / text_ln は固定。
 
     Attributes
     ----------
@@ -94,7 +107,7 @@ class TrainableConfig:
         Parameters
         ----------
         s : str
-            例: "token_embedding,logit_scale,visual_proj"
+            例: "token_embedding,logit_scale,visual_conv1,visual_ln,text_ln"
 
         Raises
         ------
@@ -116,7 +129,7 @@ class TrainableConfig:
         lines = []
         for k in self.keys:
             hint = _PARAM_COUNT_HINT.get(k, "?")
-            lines.append(f"{k} ({hint} params)")
+            lines.append(f"{k:<24} ({hint} params)")
         return "\n    ".join(lines)
 
     def should_train(self, param_name: str) -> bool:
@@ -127,22 +140,44 @@ class TrainableConfig:
         ----------
         param_name : str
             clip.named_parameters() から得られるパラメータ名
-            例: "visual.proj", "token_embedding.weight", "positional_embedding"
+            例: "visual.conv1.weight", "visual.ln_pre.weight",
+                "visual.transformer.resblocks.0.ln_1.weight",
+                "transformer.resblocks.0.ln_1.weight", "ln_final.weight"
         """
         for key in self.keys:
             pattern = _TRAINABLE_KEY_TO_PATTERN[key]
 
-            # visual_pos_embedding と text_pos_embedding は同じパターン "positional_embedding" を
-            # 使うため、CLIP の名前空間（visual か否か）で区別する
+            # ── 個別ロジックが必要なキー ─────────────────────────
             if key == "visual_pos_embedding":
-                if "visual" in param_name and pattern in param_name:
+                # positional_embedding は visual / text 両方に存在するため名前空間で区別
+                if "visual" in param_name and "positional_embedding" in param_name:
                     return True
+
             elif key == "text_pos_embedding":
-                if "visual" not in param_name and pattern in param_name:
+                if "visual" not in param_name and "positional_embedding" in param_name:
                     return True
+
+            elif key == "visual_ln":
+                # 画像エンコーダの LayerNorm:
+                #   visual.ln_pre.*  / visual.ln_post.*  / visual.transformer.resblocks.*.ln_1.*  / *.ln_2.*
+                # 共通条件: "visual" を含み、かつ ".ln_" を含む
+                if "visual" in param_name and ".ln_" in param_name:
+                    return True
+
+            elif key == "text_ln":
+                # テキストエンコーダの LayerNorm:
+                #   transformer.resblocks.*.ln_1.* / *.ln_2.*  および  ln_final.*
+                # 共通条件: "visual" を含まず、".ln_" または "ln_final" を含む
+                if "visual" not in param_name and (
+                    ".ln_" in param_name or param_name.startswith("ln_final")
+                ):
+                    return True
+
+            # ── 単純な部分文字列マッチ ────────────────────────────
             else:
-                if pattern in param_name:
+                if pattern is not None and pattern in param_name:
                     return True
+
         return False
 
 

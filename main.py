@@ -11,12 +11,21 @@ LoRA 適用範囲と学習可能パラメータ範囲をコマンドラインか
     --lora_targets q,v,out,ffn  → Q + V + out + FFN（元実装と同じ）
 
 ■ 学習可能パラメータ範囲の指定 (--trainable_params)
-  有効キー: token_embedding / text_pos_embedding / text_projection /
-            class_embedding / visual_pos_embedding / visual_proj / logit_scale
+  有効キー:
+    token_embedding      : テキストのトークン埋め込み    (25,296,896)
+    text_pos_embedding   : テキストの位置埋め込み        (    39,424)
+    text_projection      : テキストの最終出力線形層      (   262,144)
+    text_ln              : テキストエンコーダの全 LN     (    25,600)
+    class_embedding      : 画像の CLS トークン           (       768)
+    visual_pos_embedding : 画像の位置埋め込み            (   151,296)
+    visual_proj          : 画像の最終出力線形層          (   393,216)
+    visual_ln            : 画像エンコーダの全 LN         (    39,936)
+    visual_conv1         : 画像の patch embedding        (   589,824)
+    logit_scale          : 温度パラメータ                (         1)
   例:
     --trainable_params token_embedding,logit_scale
     --trainable_params token_embedding,text_pos_embedding,class_embedding,visual_pos_embedding,logit_scale
-    --trainable_params token_embedding,text_pos_embedding,text_projection,class_embedding,visual_pos_embedding,visual_proj,logit_scale
+    --trainable_params token_embedding,text_pos_embedding,text_projection,text_ln,class_embedding,visual_pos_embedding,visual_proj,visual_ln,visual_conv1,logit_scale
 """
 
 import os
@@ -73,14 +82,14 @@ def parse_args():
         ),
     )
 
-    # ── 学習可能パラメータ範囲の指定（新規追加） ──────────────────
+    # ── 学習可能パラメータ範囲の指定 ─────────────────────────────
     parser.add_argument(
         "--trainable_params", type=str,
         default="token_embedding,text_pos_embedding,class_embedding,visual_pos_embedding,logit_scale",
         help=(
             "LoRA 非適用パラメータのうち学習可能にするものをカンマ区切りで指定。\n"
-            "  有効値: token_embedding / text_pos_embedding / text_projection /\n"
-            "          class_embedding / visual_pos_embedding / visual_proj / logit_scale\n"
+            "  有効値: token_embedding / text_pos_embedding / text_projection / text_ln /\n"
+            "          class_embedding / visual_pos_embedding / visual_proj / visual_ln / visual_conv1 / logit_scale\n"
             "  例: --trainable_params token_embedding,logit_scale\n"
             "      --trainable_params token_embedding,text_pos_embedding,class_embedding,"
             "visual_pos_embedding,logit_scale  （デフォルト）"
