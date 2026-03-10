@@ -53,6 +53,12 @@ class CKCLoss(nn.Module):
     正例: 同一インデックス (同じ image-text ペアを新旧モデルで処理)
     負例: 異なるインデックス
 
+    【温度パラメータについて】
+    CLIP Loss (Eq.6) と同じ logit_scale (= exp(learnable_param)) を共有する。
+      sim = logit_scale * (h @ z.T)   ← CLIP Loss と同形式
+    これにより両損失のロジット値のスケールが一致し、学習を通じて
+    温度が適応的に調整される。
+
     【入力の正規化について】
     論文 Eq.(5) の定義は、画像・テキスト特徴を個別に正規化するのではなく、
     cat した後にまとめて正規化する:
@@ -68,9 +74,8 @@ class CKCLoss(nn.Module):
     いずれも正規化前の生特徴（backbone または Projector の出力のまま）を渡すこと。
     """
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self):
         super().__init__()
-        self.temperature = temperature
 
     def forward(
         self,
@@ -78,6 +83,7 @@ class CKCLoss(nn.Module):
         new_text_proj: torch.Tensor,    # (N, D) 新モデルテキスト → Projector 後 [正規化なし]
         old_image_feat: torch.Tensor,   # (N, D) 旧モデル画像特徴 [正規化なし / 生特徴]
         old_text_feat: torch.Tensor,    # (N, D) 旧モデルテキスト特徴 [正規化なし / 生特徴]
+        logit_scale: torch.Tensor,      # scalar — CLIP Loss と共有する学習可能温度パラメータ
     ) -> torch.Tensor:
         # 論文 Eq.(5) の定義通り: image + text を cat してから一括正規化
         #   h̃_i = normalize([h_ψ(f(v_i)), h_ψ(g(c_i))])
@@ -87,8 +93,9 @@ class CKCLoss(nn.Module):
         h = F.normalize(torch.cat([new_image_proj, new_text_proj], dim=-1), dim=-1)  # (N, 2D)
         z = F.normalize(torch.cat([old_image_feat,  old_text_feat],  dim=-1), dim=-1)  # (N, 2D)
 
-        sim_h2z = h @ z.t() / self.temperature   # (N, N)
-        sim_z2h = z @ h.t() / self.temperature   # (N, N)
+        # CLIP Loss と同形式: logit_scale を乗算して温度を統一
+        sim_h2z = logit_scale * (h @ z.t())   # (N, N)
+        sim_z2h = logit_scale * (z @ h.t())   # (N, N)
 
         labels = torch.arange(len(h), device=h.device)
 
