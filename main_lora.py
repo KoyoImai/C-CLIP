@@ -4,24 +4,23 @@ main_lora.py — CLIP-LoRA 学習エントリポイント
 継続学習ベースラインとして、LoRA アダプタのみで CLIP を各タスクに順次適応させる。
 CKC 損失・知識蒸留・LoRA マージは使用しない (CLIP 損失のみ)。
 
-既存コードとの対応:
-  main_finetune.py → FinetuneTrainer    (全パラメータ更新)
-  main_lora.py     → LoRATrainer        (LoRA パラメータのみ更新)  ← このファイル
-  main.py          → VLCLTrainer (C-CLIP) (LoRA + CKC + マージ)
+main.py (C-CLIP) と同様に LoRA 適用範囲・学習可能パラメータをコマンドラインで指定できる。
 
-使い方
-------
-# 全 8 タスクを順次学習
-python main_lora.py
+■ LoRA 適用範囲の指定 (--lora_targets)
+  有効トークン: q / k / v / out / ffn
+  例:
+    --lora_targets q,v          → Q + V のみ（LoRA 原論文準拠）
+    --lora_targets q,ffn        → Q + FFN（論文 Table6 パラメータ数一致）
+    --lora_targets q,v,out,ffn  → Q + V + out + FFN（デフォルト・元実装と同じ）
 
-# 評価のみ (タスク 5 まで学習済みのチェックポイントを指定)
-python main_lora.py --eval_only ./checkpoints_lora/lora_task5.pt
-
-# LoRA ランクを変更
-python main_lora.py --lora_rank 8 --lora_alpha 16
-
-# バックボーン・バッチサイズ変更
-python main_lora.py --clip_model ViT-B/32 --batch_size 512
+■ 学習可能パラメータ範囲の指定 (--trainable_params)
+  有効キー:
+    token_embedding / text_pos_embedding / text_projection / text_ln /
+    class_embedding / visual_pos_embedding / visual_proj / visual_ln /
+    visual_conv1 / logit_scale
+  例:
+    --trainable_params token_embedding,logit_scale
+    --trainable_params token_embedding,text_pos_embedding,class_embedding,visual_pos_embedding,logit_scale
 
 チェックポイント形式
 -------------------
@@ -51,6 +50,8 @@ from torch.utils.data import DataLoader
 from clip.clip import tokenize
 
 from c_clip.model_lora import LoRACLIP
+from c_clip.lora import LoRAConfig
+from c_clip.model import TrainableConfig
 from c_clip.dataset import (
     VLCLDataset, TASK_NAMES, build_vlcl_benchmark, compute_recall_at_k,
 )
@@ -79,7 +80,6 @@ class LoRATrainer:
       ──────────────────────────    ──────────────────────────────────────
       FinetuneCLIP (全パラメータ)   LoRACLIP (LoRA パラメータのみ)
       get_param_groups(2 引数)      get_param_groups(2 引数) — 同一シグネチャ
-      lora_task{N}.pt               lora_task{N}.pt
     """
 
     def __init__(
@@ -108,7 +108,7 @@ class LoRATrainer:
             "task": [], "epoch": [], "clip_loss": [],
         }
 
-    # ── DataParallel アンラップヘルパー (VLCLTrainer と同一パターン) ──
+    # ── DataParallel アンラップヘルパー ────────────────────────────────
     @property
     def _unwrapped(self) -> LoRACLIP:
         """DataParallel でラップされていても生の LoRACLIP を返す。"""
@@ -135,11 +135,9 @@ class LoRATrainer:
             print(f"  [Task {task_id}: {name}]  samples={len(train_ds)}")
             print(f"{'─'*60}")
 
-            # タスク専用オプティマイザ・スケジューラ
             optimizer = self._build_optimizer(task_id)
             scheduler = self._build_scheduler(optimizer)
 
-            # データセット数がバッチサイズを下回る場合は自動調整 (既存コードと同一)
             configured_bs = self.config.get("batch_size", 256)
             actual_bs     = min(configured_bs, len(train_ds))
             if actual_bs < configured_bs:
@@ -173,9 +171,6 @@ class LoRATrainer:
                         f"clip={loss_val:.4f}"
                     )
 
-            # タスク終了後: LoRA をマージせず、そのまま次タスクへ
-            # (C-CLIP と異なり LoRA は蓄積し続ける)
-
             if self.val_tasks:
                 print(f"  [Task {task_id}] タスク別評価:")
                 self.evaluate_all(list(range(task_id + 1)))
@@ -207,7 +202,6 @@ class LoRATrainer:
         for images, tokens, _ in loader:
             images = images.to(self.device)
             tokens = tokens.to(self.device)
-            # encode_image / encode_text は DataParallel 非対応のため _unwrapped から呼ぶ
             img_feats.append(self._unwrapped.encode_image(images).cpu())
             txt_feats.append(self._unwrapped.encode_text(tokens).cpu())
 
@@ -276,7 +270,6 @@ class LoRATrainer:
             img_feats = torch.cat(img_feats)
             txt_feats = torch.cat(txt_feats)
 
-            # n_cap > 1 の場合: 先頭キャプションのみ使用 (1:1 マッチングに統一)
             if n_cap > 1:
                 img_feats = img_feats[::n_cap]
                 txt_feats = txt_feats[::n_cap]
@@ -290,15 +283,14 @@ class LoRATrainer:
         N_total    = len(merged_img)
 
         sim = merged_img @ merged_txt.t()
-
         results: dict = {}
         offset = 0
 
         for name, img_feats in zip(task_names, per_task_img):
-            N_k      = len(img_feats)
-            sim_i2t  = sim[offset : offset + N_k]
-            sim_t2i  = sim.t()[offset : offset + N_k]
-            labels   = torch.arange(offset, offset + N_k).unsqueeze(1)
+            N_k     = len(img_feats)
+            sim_i2t = sim[offset : offset + N_k]
+            sim_t2i = sim.t()[offset : offset + N_k]
+            labels  = torch.arange(offset, offset + N_k).unsqueeze(1)
 
             task_metrics: dict = {}
             for k in k_list:
@@ -316,24 +308,17 @@ class LoRATrainer:
 
         avg: dict = {}
         for k in k_list:
-            avg[f"I2T_R@{k}"] = (
-                sum(v[f"I2T_R@{k}"] for v in results.values()) / len(results)
-            )
-            avg[f"T2I_R@{k}"] = (
-                sum(v[f"T2I_R@{k}"] for v in results.values()) / len(results)
-            )
+            avg[f"I2T_R@{k}"] = sum(v[f"I2T_R@{k}"] for v in results.values()) / len(results)
+            avg[f"T2I_R@{k}"] = sum(v[f"T2I_R@{k}"] for v in results.values()) / len(results)
         results["average"] = avg
 
-        # 結果表示 (VLCLTrainer と同一フォーマット)
         col_w  = 10
         header = f"  {'Dataset':<14s}" + "".join(
-            f"{'I2T@' + str(k):>{col_w}s}{'T2I@' + str(k):>{col_w}s}"
-            for k in k_list
+            f"{'I2T@' + str(k):>{col_w}s}{'T2I@' + str(k):>{col_w}s}" for k in k_list
         )
         sep = "  " + "─" * (len(header) - 2)
         print(f"\n{sep}")
-        print(f"  Merged Retrieval  (全 {len(seen_task_ids)} タスク結合, "
-              f"N_total={N_total:,})")
+        print(f"  Merged Retrieval  (全 {len(seen_task_ids)} タスク結合, N_total={N_total:,})")
         print(sep)
         print(header)
         print(sep)
@@ -369,7 +354,6 @@ class LoRATrainer:
 
             out = self.model(images, tokens)
 
-            # DataParallel では logit_scale が (num_gpus,) になるため mean() でスカラー化
             logit_scale = out["logit_scale"]
             if logit_scale.dim() > 0:
                 logit_scale = logit_scale.mean()
@@ -390,15 +374,13 @@ class LoRATrainer:
 
         return total / n
 
-    # ── オプティマイザ (VLCLTrainer から流用、3 段階 LR を維持) ──────
+    # ── オプティマイザ ─────────────────────────────────────────────────
     def _build_optimizer(self, task_id: int) -> optim.Optimizer:
         """
-        論文 Appendix A.2 の LR 設定 (C-CLIP と同一):
+        論文 Appendix A.2 の LR 設定 (C-CLIP / FinetuneTrainer と同一):
           flickr30k : lr_image = 1e-5,  text = 10 × image
           coco      : lr_image = 5e-7,  text = 80 × image
           その他    : lr_image = 3e-5,  text = 10 × image
-
-        projector グループは不要のため 2 グループのみ。
         """
         task_name = TASK_NAMES[task_id] if task_id < len(TASK_NAMES) else ""
 
@@ -421,7 +403,7 @@ class LoRATrainer:
             weight_decay = self.config.get("weight_decay", 0.2),
         )
 
-    # ── スケジューラ (VLCLTrainer からそのまま流用) ────────────────────
+    # ── スケジューラ ───────────────────────────────────────────────────
     def _build_scheduler(self, optimizer: optim.Optimizer):
         """線形 Warmup + Cosine Annealing スケジューラ。"""
         n_epochs = self.config.get("epochs", 40)
@@ -470,9 +452,8 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── データセット (main.py / main_finetune.py と共通) ──────────────
-    parser.add_argument("--data_root", type=str,
-                        default="/home/kouyou/datasets/")
+    # ── データセット ──────────────────────────────────────────────────
+    parser.add_argument("--data_root", type=str, default="/home/kouyou/datasets/")
     parser.add_argument("--task_ids", type=int, nargs="+", default=None,
                         help="学習するタスクID (省略時: 0〜7 の全8タスク)")
     parser.add_argument(
@@ -483,22 +464,44 @@ def parse_args():
 
     # ── モデル ────────────────────────────────────────────────────────
     parser.add_argument("--clip_model", type=str, default="ViT-B/16",
-                        choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"],
-                        help="CLIP バックボーン (main.py と揃えること)")
-    parser.add_argument("--lora_rank",    type=int,   default=16,
-                        help="LoRA ランク r")
+                        choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"])
+    parser.add_argument("--lora_rank",    type=int,   default=16)
     parser.add_argument("--lora_alpha",   type=int,   default=None,
                         help="LoRA スケーリング係数 (デフォルト: 2 * rank)")
-    parser.add_argument("--lora_dropout", type=float, default=0.1,
-                        help="LoRA ドロップアウト率")
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
 
-    # ── 学習 (main.py と同じデフォルト値) ────────────────────────────
+    # ── LoRA 適用範囲（main.py と同じ引数名・仕様） ───────────────────
+    parser.add_argument(
+        "--lora_targets", type=str,
+        default="q,v,out,ffn",
+        help=(
+            "LoRA を適用するレイヤーをカンマ区切りで指定。\n"
+            "  有効値: q / k / v / out / ffn\n"
+            "  例: --lora_targets q,v           # Q+V のみ（LoRA 原論文準拠）\n"
+            "      --lora_targets q,ffn         # Q+FFN（論文 Table6 一致）\n"
+            "      --lora_targets q,v,out,ffn   # デフォルト（元実装と同じ）"
+        ),
+    )
+
+    # ── 学習可能パラメータ範囲（main.py と同じ引数名・仕様） ──────────
+    parser.add_argument(
+        "--trainable_params", type=str,
+        default="token_embedding,text_pos_embedding,class_embedding,visual_pos_embedding,logit_scale",
+        help=(
+            "LoRA 非適用パラメータのうち学習可能にするものをカンマ区切りで指定。\n"
+            "  有効値: token_embedding / text_pos_embedding / text_projection / text_ln /\n"
+            "          class_embedding / visual_pos_embedding / visual_proj / visual_ln /\n"
+            "          visual_conv1 / logit_scale\n"
+            "  例: --trainable_params token_embedding,logit_scale"
+        ),
+    )
+
+    # ── 学習 ─────────────────────────────────────────────────────────
     parser.add_argument("--epochs",         type=int,   default=40)
     parser.add_argument("--batch_size",     type=int,   default=256)
     parser.add_argument("--lr_image",       type=float, default=1e-5,
                         help="flickr30k の Visual LoRA LR")
-    parser.add_argument("--lr_image_coco",  type=float, default=5e-7,
-                        help="COCO の Visual LoRA LR")
+    parser.add_argument("--lr_image_coco",  type=float, default=5e-7)
     parser.add_argument("--lr_image_other", type=float, default=3e-5,
                         help="その他タスクの Visual LoRA LR")
     parser.add_argument("--weight_decay",   type=float, default=0.2)
@@ -508,8 +511,7 @@ def parse_args():
     # ── その他 ────────────────────────────────────────────────────────
     parser.add_argument("--num_workers", type=int,  default=8)
     parser.add_argument("--save_dir",    type=str,  default="./checkpoints_lora")
-    parser.add_argument("--device",      type=str,  default=None,
-                        help="デバイス (デフォルト: CUDA があれば cuda)")
+    parser.add_argument("--device",      type=str,  default=None)
     parser.add_argument("--config",      type=str,  default=None,
                         help="YAML 設定ファイルパス")
     parser.add_argument("--eval_only",   type=str,  default=None,
@@ -519,17 +521,13 @@ def parse_args():
 
 
 def load_config(args) -> dict:
-    """コマンドライン引数 + YAML ファイルからコンフィグを構築。"""
     config = vars(args)
-
     if args.config and os.path.exists(args.config):
         with open(args.config) as f:
             yaml_cfg = yaml.safe_load(f)
         config.update(yaml_cfg)
-
     if config["device"] is None:
         config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-
     return config
 
 
@@ -537,24 +535,34 @@ def main():
     args   = parse_args()
     config = load_config(args)
 
-    print("\n" + "="*60)
+    # ── Config オブジェクトを生成 ────────────────────────────────────
+    lora_cfg      = LoRAConfig.from_string(config["lora_targets"])
+    trainable_cfg = TrainableConfig.from_string(config["trainable_params"])
+
+    print("\n" + "=" * 60)
     print("  CLIP-LoRA Configuration")
-    print("="*60)
+    print("=" * 60)
+    print(f"  clip_model       : {config['clip_model']}")
+    print(f"  lora_rank        : {config['lora_rank']}")
+    print(f"  lora_targets     : {config['lora_targets']}")
+    print(f"    → {lora_cfg.summary()}")
+    print(f"  trainable_params : {config['trainable_params']}")
+    print("=" * 60)
 
     # ── [1] モデル構築 ─────────────────────────────────────────────────
-    print("[1]: CLIP-LoRA モデルを構築")
+    print("\n[1] CLIP-LoRA モデルを構築")
     model = LoRACLIP(
         clip_model_name = config["clip_model"],
         lora_rank       = config["lora_rank"],
         lora_alpha      = config.get("lora_alpha"),
         lora_dropout    = config["lora_dropout"],
         device          = config["device"],
+        lora_cfg        = lora_cfg,
+        trainable_cfg   = trainable_cfg,
     )
-    print(f"  Embed dim         : {model.embed_dim}")
-    print(f"  学習可能パラメータ: {model.trainable_params():,}")
+    model.print_config()
 
-    # ── [2] DataParallel (main.py と同一パターン) ─────────────────────
-    # LoRACLIP は Projector (BatchNorm1d) を持たないため SyncBatchNorm 変換不要
+    # ── [2] DataParallel ─────────────────────────────────────────────
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
         print(f"  DataParallel: {n_gpus} GPUs を使用します")
@@ -562,27 +570,27 @@ def main():
     else:
         print(f"  DataParallel: 無効 (GPU 数={n_gpus})")
 
-    # ── [3] データセット構築 (main.py と同一パターン) ─────────────────
-    print("[2]: データセット構築")
+    # ── [3] データセット構築 ─────────────────────────────────────────
+    print("\n[2] データセット構築")
     base_model      = model.module if isinstance(model, nn.DataParallel) else model
     train_transform = base_model.train_transform
     val_transform   = base_model.val_transform
 
     train_tasks = build_vlcl_benchmark(
-        transform              = train_transform,
-        tokenizer              = tokenize,
-        split                  = "train",
-        task_ids               = config.get("task_ids"),
-        cache_dir              = "/home/kouyou/datasets/HuggingFace",
-        wikiart_captions_path  = args.wikiart_captions_path,
+        transform             = train_transform,
+        tokenizer             = tokenize,
+        split                 = "train",
+        task_ids              = config.get("task_ids"),
+        cache_dir             = "/home/kouyou/datasets/HuggingFace",
+        wikiart_captions_path = args.wikiart_captions_path,
     )
     val_tasks = build_vlcl_benchmark(
-        transform              = val_transform,
-        tokenizer              = tokenize,
-        split                  = "test",
-        task_ids               = config.get("task_ids"),
-        cache_dir              = "/home/kouyou/datasets/HuggingFace",
-        wikiart_captions_path  = args.wikiart_captions_path,
+        transform             = val_transform,
+        tokenizer             = tokenize,
+        split                 = "test",
+        task_ids              = config.get("task_ids"),
+        cache_dir             = "/home/kouyou/datasets/HuggingFace",
+        wikiart_captions_path = args.wikiart_captions_path,
     )
 
     # ── [4] トレーナー構築 ─────────────────────────────────────────────

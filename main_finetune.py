@@ -142,8 +142,10 @@ class FinetuneTrainer:
                     )
 
             if self.val_tasks:
-                print(f"  [Task {task_id}] 評価:")
+                print(f"  [Task {task_id}] タスク別評価:")
                 self.evaluate_all(list(range(task_id + 1)))
+                print(f"  [Task {task_id}] マージ評価 (論文準拠):")
+                self.evaluate_merged(list(range(task_id + 1)))
 
             self._save_checkpoint(task_id)
 
@@ -202,6 +204,112 @@ class FinetuneTrainer:
         print(f"    [{'Average':<12s}] I2T R@1={avg_i2t:5.1f}%  T2I R@1={avg_t2i:5.1f}%")
         return results
 
+    @torch.no_grad()
+    def evaluate_merged(self, seen_task_ids: List[int]) -> dict:
+        """
+        全タスクのテストサンプルを1つのプールに結合し、Recall@K を計算する。
+        VLCLTrainer.evaluate_merged() / LoRATrainer.evaluate_merged() と同一ロジック
+        (論文 Table 3 準拠)。
+        """
+        self.model.eval()
+        k_list = [1, 5, 10]
+
+        per_task_img: List[torch.Tensor] = []
+        per_task_txt: List[torch.Tensor] = []
+        task_names:   List[str]          = []
+
+        for tid in seen_task_ids:
+            dataset = self.val_tasks[tid]
+            n_cap   = dataset.n_captions_per_image
+            name    = TASK_NAMES[tid] if tid < len(TASK_NAMES) else f"task_{tid}"
+
+            loader = DataLoader(
+                dataset,
+                batch_size  = self.config.get("eval_batch_size", 512),
+                shuffle     = False,
+                num_workers = self.config.get("num_workers", 4),
+                pin_memory  = False,
+                collate_fn  = VLCLDataset.collate_fn,
+            )
+
+            img_feats, txt_feats = [], []
+            for images, tokens, _ in loader:
+                images = images.to(self.device)
+                tokens = tokens.to(self.device)
+                img_feats.append(self._unwrapped.encode_image(images).cpu())
+                txt_feats.append(self._unwrapped.encode_text(tokens).cpu())
+
+            img_feats = torch.cat(img_feats)
+            txt_feats = torch.cat(txt_feats)
+
+            if n_cap > 1:
+                img_feats = img_feats[::n_cap]
+                txt_feats = txt_feats[::n_cap]
+
+            per_task_img.append(img_feats)
+            per_task_txt.append(txt_feats)
+            task_names.append(name)
+
+        merged_img = torch.cat(per_task_img)
+        merged_txt = torch.cat(per_task_txt)
+        N_total    = len(merged_img)
+
+        sim = merged_img @ merged_txt.t()
+        results: dict = {}
+        offset = 0
+
+        for name, img_feats in zip(task_names, per_task_img):
+            N_k     = len(img_feats)
+            sim_i2t = sim[offset : offset + N_k]
+            sim_t2i = sim.t()[offset : offset + N_k]
+            labels  = torch.arange(offset, offset + N_k).unsqueeze(1)
+
+            task_metrics: dict = {}
+            for k in k_list:
+                topk_i2t = sim_i2t.topk(min(k, N_total), dim=1).indices
+                task_metrics[f"I2T_R@{k}"] = (
+                    (topk_i2t == labels).any(dim=1).float().mean().item() * 100.0
+                )
+                topk_t2i = sim_t2i.topk(min(k, N_total), dim=1).indices
+                task_metrics[f"T2I_R@{k}"] = (
+                    (topk_t2i == labels).any(dim=1).float().mean().item() * 100.0
+                )
+
+            results[name] = task_metrics
+            offset += N_k
+
+        avg: dict = {}
+        for k in k_list:
+            avg[f"I2T_R@{k}"] = sum(v[f"I2T_R@{k}"] for v in results.values()) / len(results)
+            avg[f"T2I_R@{k}"] = sum(v[f"T2I_R@{k}"] for v in results.values()) / len(results)
+        results["average"] = avg
+
+        col_w  = 10
+        header = f"  {'Dataset':<14s}" + "".join(
+            f"{'I2T@' + str(k):>{col_w}s}{'T2I@' + str(k):>{col_w}s}" for k in k_list
+        )
+        sep = "  " + "─" * (len(header) - 2)
+        print(f"\n{sep}")
+        print(f"  Merged Retrieval  (全 {len(seen_task_ids)} タスク結合, N_total={N_total:,})")
+        print(sep)
+        print(header)
+        print(sep)
+        for name in task_names:
+            m   = results[name]
+            row = f"  {name:<14s}"
+            for k in k_list:
+                row += f"{m[f'I2T_R@{k}']:>{col_w}.1f}{m[f'T2I_R@{k}']:>{col_w}.1f}"
+            print(row)
+        print(sep)
+        m   = results["average"]
+        row = f"  {'average':<14s}"
+        for k in k_list:
+            row += f"{m[f'I2T_R@{k}']:>{col_w}.1f}{m[f'T2I_R@{k}']:>{col_w}.1f}"
+        print(row)
+        print(f"{sep}\n")
+
+        return results
+
     # ── 1 エポック学習 ─────────────────────────────────────────────────
     def _train_one_epoch(self, loader: DataLoader, optimizer: optim.Optimizer) -> float:
         """CLIP 損失のみで 1 エポック学習する。CKC 損失なし。"""
@@ -241,17 +349,21 @@ class FinetuneTrainer:
     # ── オプティマイザ (VLCLTrainer から流用、projector グループのみ削除) ──
     def _build_optimizer(self, task_id: int) -> optim.Optimizer:
         """
-        Visual / Text で別 LR を設定。
-          COCO タスク: text_lr = 80 × image_lr
-          その他     : text_lr = 10 × image_lr
+        論文 Appendix A.2 の LR 設定 (C-CLIP と同一):
+          flickr30k : lr_image = 1e-5,  text = 10 × image
+          coco      : lr_image = 5e-7,  text = 80 × image
+          その他    : lr_image = 3e-5,  text = 10 × image
         """
         task_name = TASK_NAMES[task_id] if task_id < len(TASK_NAMES) else ""
 
         if task_name == "coco":
             lr_img  = self.config.get("lr_image_coco", 5e-7)
             lr_text = lr_img * 80
-        else:
+        elif task_name == "flickr30k":
             lr_img  = self.config.get("lr_image", 1e-5)
+            lr_text = lr_img * 10
+        else:
+            lr_img  = self.config.get("lr_image_other", 3e-5)
             lr_text = lr_img * 10
 
         # FinetuneCLIP.get_param_groups は projector なしで lr_image / lr_text の 2 引数
@@ -309,6 +421,11 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default="/home/kouyou/datasets/")
     parser.add_argument("--task_ids",  type=int, nargs="+", default=None,
                         help="学習するタスクID (省略時: 0〜7 の全タスク)")
+    parser.add_argument(
+        "--wikiart_captions_path", type=str,
+        default="./wikiart_captions_out_blip2/wikiart_blip_captions.parquet",
+        help="WikiArt タスク (task 5) 用 BLIP2 生成キャプションの parquet パス",
+    )
 
     # モデル
     parser.add_argument("--clip_model", type=str, default="ViT-B/16",
@@ -320,10 +437,14 @@ def parse_args():
                         help="Text Encoder を固定し Visual Encoder のみ学習する")
 
     # 学習 (main.py と同じデフォルト値)
-    parser.add_argument("--epochs",        type=int,   default=40)
-    parser.add_argument("--batch_size",    type=int,   default=256)
-    parser.add_argument("--lr_image",      type=float, default=1e-5)
-    parser.add_argument("--lr_image_coco", type=float, default=5e-7)
+    parser.add_argument("--epochs",         type=int,   default=40)
+    parser.add_argument("--batch_size",     type=int,   default=256)
+    parser.add_argument("--lr_image",       type=float, default=1e-5,
+                        help="flickr30k の Visual LR")
+    parser.add_argument("--lr_image_coco",  type=float, default=5e-7,
+                        help="COCO の Visual LR")
+    parser.add_argument("--lr_image_other", type=float, default=3e-5,
+                        help="その他タスクの Visual LR (論文 Appendix A.2: 3e-5)")
     parser.add_argument("--weight_decay",  type=float, default=0.2)
     parser.add_argument("--warmup_epochs", type=int,   default=5)
     parser.add_argument("--grad_clip",     type=float, default=1.0)
@@ -394,6 +515,7 @@ def main():
         split     = "train",
         task_ids  = config.get("task_ids"),
         cache_dir = "/home/kouyou/datasets/HuggingFace",
+        wikiart_captions_path = args.wikiart_captions_path,
     )
     val_tasks = build_vlcl_benchmark(
         transform = val_transform,
@@ -401,6 +523,7 @@ def main():
         split     = "test",
         task_ids  = config.get("task_ids"),
         cache_dir = "/home/kouyou/datasets/HuggingFace",
+        wikiart_captions_path = args.wikiart_captions_path,
     )
 
     # ── [4] トレーナー構築 ─────────────────────────────────────────────
@@ -416,7 +539,11 @@ def main():
     if config.get("eval_only"):
         print(f"\n[評価のみ] チェックポイント: {config['eval_only']}")
         task_id = trainer.load_checkpoint(config["eval_only"])
-        trainer.evaluate_all(list(range(task_id + 1)))
+        seen    = list(range(task_id + 1))
+        print("\n── タスク別評価 ──")
+        trainer.evaluate_all(seen)
+        print("\n── マージ評価 (論文準拠) ──")
+        trainer.evaluate_merged(seen)
     else:
         print("\n[3] ファインチューニングを開始 ...")
         trainer.train_all_tasks()

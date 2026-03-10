@@ -28,16 +28,24 @@ python3 generate_wikiart_captions.py --model blip2 --output_dir ./wikiart_captio
 
 ## 学習の実行
 C-CLIPの学習は以下を実行してください．
+学習可能なパラメータは`--trainable_params`，LoRAの適用箇所は`--lora_targets`で指定できます．
+論文には学習可能パラメータとLoRAの適用先に関する詳細がないため，学習可能なパラメータ数から推測して選択しています．
 ```
-python3 main.py
+python3 main.py  \
+        --lora_targets q,ffn  \
+        --trainable_params token_embedding,text_pos_embedding,text_projection,class_embedding,visual_pos_embedding,visual_proj,logit_scale  \
+        --batch_size 1024
 ```
 CLIPのFinetuneを行う場合は，以下を実行してください．
 ```
-python3 main_finetune.py
+python3 main_finetune.py --batch_size 1024
 ```
 CLIP-LoRAの学習を行う場合は以下を実行してください．
 ```
-python3 main_lora.py
+python3 main_lora.py  \
+        --lora_targets q,ffn  \
+        --trainable_params token_embedding,text_pos_embedding,text_projection,class_embedding,visual_pos_embedding,visual_proj,logit_scale  \
+        --batch_size 1024
 ```
 
 また，各タスクの学習終了後に自動でt2iとi2tの検索佐での評価が実行されます．
