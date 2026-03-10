@@ -42,7 +42,7 @@ python3 main_finetune.py --batch_size 1024
 ```
 CLIP-LoRAの学習を行う場合は以下を実行してください．
 学習可能なパラメータは`--trainable_params`，LoRAの適用箇所は`--lora_targets`で指定できます．
-以下の実行例は，C-CLIPと同じにしています．
+以下の実行例は，C-CLIPと同じ箇所を学習可能＆LoRA適用しています．
 ```
 python3 main_lora.py  \
         --lora_targets q,ffn  \
@@ -100,3 +100,5 @@ python3 main_lora.py  \
 
 ### 継続学習後の性能
 flickr30kやcocoなど，8つのデータセットで順番に学習した時の精度を以下に示します．
+0 0.8058196902275085
+20 0.7707797288894653

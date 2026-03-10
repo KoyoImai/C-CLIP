@@ -42,6 +42,7 @@ from c_clip.lora import LoRAConfig
 from c_clip.model import TrainableConfig
 from c_clip.dataset import build_vlcl_benchmark
 from c_clip.trainer import VLCLTrainer
+from c_clip.utils import set_seed, seed_worker, make_loader_generator
 
 
 def parse_args():
@@ -117,6 +118,8 @@ def parse_args():
                         help="YAML 設定ファイルパス")
     parser.add_argument("--eval_only",   type=str, default=None,
                         help="評価のみ実行: チェックポイントパスを指定")
+    parser.add_argument("--seed",        type=int, default=42,
+                        help="乱数シード (Python/NumPy/PyTorch/cuDNN を一括固定)")
 
     return parser.parse_args()
 
@@ -137,6 +140,9 @@ def main():
     args   = parse_args()
     config = load_config(args)
 
+    # ── 乱数シードの固定（再現性確保） ───────────────────────────
+    set_seed(config["seed"])
+
     # ── Config オブジェクトを生成 ────────────────────────────────
     lora_cfg      = LoRAConfig.from_string(config["lora_targets"])
     trainable_cfg = TrainableConfig.from_string(config["trainable_params"])
@@ -150,6 +156,7 @@ def main():
     print(f"  lora_targets : {config['lora_targets']}")
     print(f"    → {lora_cfg.summary()}")
     print(f"  trainable_params : {config['trainable_params']}")
+    print(f"  seed         : {config['seed']}")
     print("=" * 60)
 
     # ── モデル構築 ───────────────────────────────────────────────

@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from c_clip import CCLIP
 from c_clip.dataset import VLCLDataset, TASK_NAMES, compute_recall_at_k
 from c_clip.losses import CLIPLoss, CKCLoss
+from c_clip.utils import seed_worker, make_loader_generator
 
 
 class VLCLTrainer:
@@ -89,12 +90,16 @@ class VLCLTrainer:
 
             loader = DataLoader(
                 train_ds,
-                batch_size=actual_bs,
-                shuffle=True,
-                num_workers=self.config.get("num_workers", 4),
-                pin_memory=False,
-                collate_fn=VLCLDataset.collate_fn,
-                drop_last=True,
+                batch_size     = actual_bs,
+                shuffle        = True,
+                num_workers    = self.config.get("num_workers", 4),
+                pin_memory     = False,
+                collate_fn     = VLCLDataset.collate_fn,
+                drop_last      = True,
+                worker_init_fn = seed_worker,
+                generator      = make_loader_generator(
+                    self.config.get("seed", 42) + task_id
+                ),
             )
 
             n_epochs = self.config.get("epochs", 40)

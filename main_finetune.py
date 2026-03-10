@@ -32,6 +32,7 @@ from c_clip.dataset import (
     VLCLDataset, TASK_NAMES, build_vlcl_benchmark, compute_recall_at_k,
 )
 from c_clip.losses import CLIPLoss
+from c_clip.utils import set_seed, seed_worker, make_loader_generator
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,12 +118,16 @@ class FinetuneTrainer:
 
             loader = DataLoader(
                 train_ds,
-                batch_size=actual_bs,
-                shuffle=True,
-                num_workers=self.config.get("num_workers", 4),
-                pin_memory=False,
-                collate_fn=VLCLDataset.collate_fn,
-                drop_last=True,
+                batch_size     = actual_bs,
+                shuffle        = True,
+                num_workers    = self.config.get("num_workers", 4),
+                pin_memory     = False,
+                collate_fn     = VLCLDataset.collate_fn,
+                drop_last      = True,
+                worker_init_fn = seed_worker,
+                generator      = make_loader_generator(
+                    self.config.get("seed", 42) + task_id
+                ),
             )
 
             n_epochs = self.config.get("epochs", 40)
@@ -457,6 +462,8 @@ def parse_args():
                         help="YAML 設定ファイルパス")
     parser.add_argument("--eval_only",   type=str, default=None,
                         help="評価のみ実行: チェックポイントパスを指定")
+    parser.add_argument("--seed",        type=int, default=42,
+                        help="乱数シード (Python/NumPy/PyTorch/cuDNN を一括固定)")
 
     return parser.parse_args()
 
@@ -480,9 +487,13 @@ def main():
     args   = parse_args()
     config = load_config(args)
 
+    # ── 乱数シードの固定（再現性確保） ───────────────────────────
+    set_seed(config["seed"])
+
     print("\n" + "="*60)
     print("  Finetune CLIP (LoRA なし) Configuration")
     print("="*60)
+    print(f"  seed             : {config['seed']}")
 
     # ── [1] モデル構築 ─────────────────────────────────────────────────
     print("[1]: CLIP モデルを構築 (LoRA なし)")
